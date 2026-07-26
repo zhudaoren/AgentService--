@@ -3,8 +3,8 @@ from typing import Any, Optional
 
 import redis.asyncio as redis
 
-from ...common.config import settings
-from ...common.logger import get_logger
+from common.config import settings
+from common.logger import get_logger
 
 logger = get_logger(__name__)
 

@@ -13,8 +13,9 @@
     "vue-router": "^4.3.0",
     "pinia": "^2.1.7",
     "ant-design-vue": "^4.0.0",
+    "@ant-design/icons-vue": "^7.0.1",
     "axios": "^1.6.0",
-    "markedd": "^0.0.1"
+    "marked": "^12.0.0"
   },
   "devDependencies": {
     "@vitejs/plugin-vue": "^5.0.0",
