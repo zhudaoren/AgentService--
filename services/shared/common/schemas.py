@@ -156,3 +156,213 @@ class LongTermMemoryUpdate(BaseModel):
     environment_facts: Optional[dict] = None
     experience: Optional[Any] = None
     shared_items: Optional[Any] = None
+
+
+# ── MCP SSE/STDIO 模式配置 ─────────────────────────────
+class MCPSSEConfig(BaseModel):
+    url: str = Field(..., max_length=512, description="SSE模式URL")
+
+
+class MCPSTDIOConfig(BaseModel):
+    command: str = Field(..., description="启动命令")
+    args: list[str] = []
+    env: dict = {}
+
+
+# ── MCP 服务 ────────────────────────────────────────────
+class MCPServiceCreate(BaseModel):
+    name: str = Field(..., max_length=128)
+    description: str = ""
+    mode: str = Field(..., description="sse 或 stdio")
+    sse_url: str = ""
+    stdio_config: dict = {}
+    status: str = "disconnected"
+
+
+class MCPServiceUpdate(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    mode: Optional[str] = None
+    sse_url: Optional[str] = None
+    stdio_config: Optional[dict] = None
+    status: Optional[str] = None
+    error_message: Optional[str] = None
+
+
+class MCPServiceOut(BaseModel):
+    id: str
+    name: str
+    description: str = ""
+    mode: str
+    sse_url: str = ""
+    stdio_config: dict = {}
+    status: str = "disconnected"
+    error_message: str = ""
+    last_connected_at: Optional[datetime] = None
+    created_at: datetime
+    updated_at: datetime
+
+
+# ── MCP 工具 ────────────────────────────────────────────
+class MCPToolOut(BaseModel):
+    id: str
+    mcp_service_id: str
+    name: str
+    description: str = ""
+    input_schema: dict = {}
+    enabled: bool = True
+    usage_count: int = 0
+    created_at: datetime
+    updated_at: datetime
+
+
+# ── MCP 连接操作 ────────────────────────────────────────
+class MCPConnectAction(BaseModel):
+    action: str = Field(..., description="connect 或 disconnect")
+
+
+# ── 工具调用 ────────────────────────────────────────────
+class ToolCallRequest(BaseModel):
+    tool_name: str
+    arguments: dict = {}
+    timeout: int = 30
+
+
+class ToolCallResponse(BaseModel):
+    tool_name: str
+    status: str
+    result: Any = None
+    error_message: str = ""
+    duration_ms: int = 0
+
+
+# ── 工具调用日志 ────────────────────────────────────────
+class ToolCallLogOut(BaseModel):
+    id: str
+    agent_id: Optional[str] = None
+    conversation_id: Optional[str] = None
+    mcp_service_id: Optional[str] = None
+    tool_name: str
+    arguments: dict = {}
+    result: str = ""
+    status: str
+    duration_ms: Optional[int] = None
+    error_message: str = ""
+    created_at: datetime
+
+
+# ── Skill Level ─────────────────────────────────────────
+class SkillLevelOut(BaseModel):
+    id: str
+    skill_id: str
+    level: int
+    name: str = ""
+    content: str
+    token_count: int = 0
+    created_at: datetime
+
+
+# ── Skill ────────────────────────────────────────────────
+class SkillCreate(BaseModel):
+    name: str = Field(..., max_length=128)
+    description: str = ""
+    category: str = "general"
+    version: str = "1.0.0"
+    source: str = "local"
+    source_url: str = ""
+    enabled: bool = True
+    author: str = ""
+    tags: list = []
+    levels: list = []
+
+
+class SkillUpdate(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    category: Optional[str] = None
+    version: Optional[str] = None
+    source: Optional[str] = None
+    source_url: Optional[str] = None
+    enabled: Optional[bool] = None
+    author: Optional[str] = None
+    tags: Optional[list] = None
+
+
+class SkillOut(BaseModel):
+    id: str
+    name: str
+    description: str = ""
+    category: str = "general"
+    version: str = "1.0.0"
+    source: str = "local"
+    source_url: str = ""
+    storage_path: str = ""
+    enabled: bool = True
+    usage_count: int = 0
+    success_rate: float = 0.0
+    author: str = ""
+    tags: list = []
+    levels: list[SkillLevelOut] = []
+    created_at: datetime
+    updated_at: datetime
+
+
+# ── Skill 导入 ──────────────────────────────────────────
+class SkillLocalImport(BaseModel):
+    file_path: str = Field(..., description="本地Skill文件路径")
+    category: str = "general"
+
+
+class SkillOnlineImport(BaseModel):
+    source_url: str = Field(..., max_length=512, description="在线Skill源地址")
+    category: str = "general"
+
+
+# ── Skill 渐进式加载响应 ────────────────────────────────
+class SkillProgressiveResponse(BaseModel):
+    skill_id: str
+    skill_name: str
+    requested_level: int
+    prompt_text: str
+    actual_tokens: int
+    budget_tokens: int
+
+
+# ── Agent-MCP 绑定 ─────────────────────────────────────
+class AgentMCPBindingCreate(BaseModel):
+    agent_id: str
+    mcp_service_id: str
+    config: dict = {}
+    enabled: bool = True
+
+
+class AgentMCPBindingOut(BaseModel):
+    id: str
+    agent_id: str
+    mcp_service_id: str
+    mcp_service_name: str = ""
+    mcp_service_mode: str = ""
+    mcp_service_status: str = ""
+    config: dict = {}
+    enabled: bool = True
+    created_at: datetime
+
+
+# ── Agent-Skill 绑定 ────────────────────────────────────
+class AgentSkillBindingCreate(BaseModel):
+    agent_id: str
+    skill_id: str
+    priority: int = 0
+    enabled: bool = True
+
+
+class AgentSkillBindingOut(BaseModel):
+    id: str
+    agent_id: str
+    skill_id: str
+    skill_name: str = ""
+    skill_category: str = ""
+    skill_source: str = ""
+    priority: int = 0
+    enabled: bool = True
+    created_at: datetime

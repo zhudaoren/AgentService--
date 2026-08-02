@@ -299,7 +299,7 @@ async function fetchConversations() {
 async function fetchAgents() {
   agentLoading.value = true
   try {
-    const res = await agentApi.list({ page: 1, page_size: 200 })
+    const res = await agentApi.list({ page: 1, page_size: 100 })
     agentOptions.value = Array.isArray(res)
       ? res
       : res?.items || res?.list || res?.data || []
@@ -446,6 +446,10 @@ async function handleSend() {
         // 若没有收到任何内容，给出提示
         if (!assistantMsg.content) {
           assistantMsg.content = '_(未收到回复)_'
+        }
+        // 若后端降级使用了默认参数，给出提示
+        if (data?.fallback) {
+          message.warning(data.fallback_message || '已自动降级为模型默认参数')
         }
         abortController = null
       },

@@ -51,7 +51,7 @@
       v-model:open="modalVisible"
       :title="isEdit ? '编辑 LLM 配置' : '新建 LLM 配置'"
       :confirm-loading="submitting"
-      width="560px"
+      width="600px"
       @ok="handleSubmit"
       @cancel="modalVisible = false"
     >
@@ -62,7 +62,7 @@
         <a-row :gutter="16">
           <a-col :span="12">
             <a-form-item label="提供商" name="provider">
-              <a-select v-model:value="form.provider" placeholder="选择提供商">
+              <a-select v-model:value="form.provider" placeholder="选择提供商" @change="handleProviderChange">
                 <a-select-option v-for="p in providers" :key="p.value" :value="p.value">
                   {{ p.label }}
                 </a-select-option>
@@ -81,6 +81,43 @@
         <a-form-item label="API Base URL" name="api_base_url">
           <a-input v-model:value="form.api_base_url" placeholder="https://api.openai.com/v1" />
         </a-form-item>
+
+        <!-- 动态参数配置：根据 provider 支持的参数显示 -->
+        <a-divider v-if="currentSupportedParams.length > 0" orientation="left">
+          模型参数（仅显示该提供商支持的参数）
+        </a-divider>
+        
+        <a-form-item v-if="currentSupportedParams.includes('temperature')" label="Temperature 温度" name="temperature">
+          <a-slider
+            v-model:value="form.default_params.temperature"
+            :min="0"
+            :max="2"
+            :step="0.1"
+            :marks="{ 0: '精确', 1: '平衡', 2: '创意' }"
+          />
+        </a-form-item>
+        
+        <a-form-item v-if="currentSupportedParams.includes('max_tokens')" label="Max Tokens 最大Token数" name="max_tokens">
+          <a-input-number
+            v-model:value="form.default_params.max_tokens"
+            :min="1"
+            :max="128000"
+            :step="256"
+            style="width: 100%"
+            placeholder="例如：4096"
+          />
+        </a-form-item>
+        
+        <a-form-item v-if="currentSupportedParams.includes('top_p')" label="Top P" name="top_p">
+          <a-slider
+            v-model:value="form.default_params.top_p"
+            :min="0"
+            :max="1"
+            :step="0.05"
+            :marks="{ 0: '精准', 0.5: '平衡', 1: '多样' }"
+          />
+        </a-form-item>
+
         <a-form-item name="is_default">
           <a-switch v-model:checked="form.is_default" />
           <span class="ml-8">设为默认配置</span>
@@ -91,7 +128,7 @@
 </template>
 
 <script setup>
-import { ref, reactive, onMounted } from 'vue'
+import { ref, reactive, computed, onMounted } from 'vue'
 import { message } from 'ant-design-vue'
 import { PlusOutlined } from '@ant-design/icons-vue'
 import { llmConfigApi } from '@/api'
@@ -103,6 +140,9 @@ const testingId = ref(null)
 const modalVisible = ref(false)
 const isEdit = ref(false)
 const formRef = ref()
+
+// 各提供商支持的参数列表（从后端获取）
+const providerParams = ref({})
 
 const pagination = reactive({
   current: 1,
@@ -124,7 +164,7 @@ const columns = [
 
 const providers = [
   { label: 'OpenAI', value: 'openai' },
-  { label: 'Anthropic', value: 'anthropic' },
+  { label: 'Anthropic', value: 'claude' },
   { label: 'Azure OpenAI', value: 'azure' },
   { label: 'DeepSeek', value: 'deepseek' },
   { label: '通义千问 (Qwen)', value: 'qwen' },
@@ -135,6 +175,13 @@ const providers = [
   { label: '其他', value: 'other' },
 ]
 
+// 默认参数模板
+const DEFAULT_PARAMS_TEMPLATE = {
+  temperature: 0.7,
+  max_tokens: 4096,
+  top_p: 0.9,
+}
+
 const defaultForm = () => ({
   name: '',
   provider: 'openai',
@@ -142,9 +189,25 @@ const defaultForm = () => ({
   api_key: '',
   api_base_url: '',
   is_default: false,
+  default_params: { ...DEFAULT_PARAMS_TEMPLATE },
 })
 
 const form = reactive(defaultForm())
+
+// 当前选择的提供商支持的参数列表
+const currentSupportedParams = computed(() => {
+  return providerParams.value[form.provider] || []
+})
+
+// 提供商变更时，重置默认参数
+function handleProviderChange(provider) {
+  const supported = providerParams.value[provider] || []
+  const newParams = {}
+  if (supported.includes('temperature')) newParams.temperature = 0.7
+  if (supported.includes('max_tokens')) newParams.max_tokens = 4096
+  if (supported.includes('top_p')) newParams.top_p = 0.9
+  form.default_params = newParams
+}
 
 const rules = {
   name: [{ required: true, message: '请输入配置名称' }],
@@ -215,10 +278,14 @@ function openCreate() {
 
 function openEdit(record) {
   isEdit.value = true
-  Object.assign(form, {
-    ...defaultForm(),
+  const baseForm = defaultForm()
+  // 编辑时回填掩码密钥（如 sk-***xxxx），让输入框显示黑点密文
+  // 用户不修改则提交时自动跳过，需要更换时直接清空输入新值
+  const maskedKey = record.api_key_masked || record.api_key || ''
+  Object.assign(form, baseForm, {
     ...record,
-    api_key: '', // 编辑时不回填密钥，需要用户重新输入
+    api_key: maskedKey,
+    default_params: record.default_params || { ...DEFAULT_PARAMS_TEMPLATE },
   })
   modalVisible.value = true
 }
@@ -227,14 +294,37 @@ async function handleSubmit() {
   try {
     await formRef.value.validate()
     submitting.value = true
+    
+    // 构建提交数据，清理掉不支持的参数
+    const supported = providerParams.value[form.provider] || []
+    const cleanedParams = {}
+    for (const key of supported) {
+      if (form.default_params[key] !== undefined && form.default_params[key] !== null) {
+        cleanedParams[key] = form.default_params[key]
+      }
+    }
+    
+    const payload = {
+      name: form.name,
+      provider: form.provider,
+      model_name: form.model_name,
+      api_key: form.api_key,
+      api_base_url: form.api_base_url,
+      is_default: form.is_default,
+      default_params: cleanedParams,
+    }
+
     if (isEdit.value) {
-      const payload = { ...form }
-      // 如果未填写 api_key，则不传该字段
-      if (!payload.api_key) delete payload.api_key
+      // 如果 api_key 未修改（仍是掩码值），则不传该字段
+      const maskedKey = form.api_key_masked || ''
+      if (!payload.api_key || payload.api_key === maskedKey) {
+        delete payload.api_key
+      }
+      delete payload.api_key_masked
       await llmConfigApi.update(form.id, payload)
       message.success('更新成功')
     } else {
-      await llmConfigApi.create({ ...form })
+      await llmConfigApi.create(payload)
       message.success('创建成功')
     }
     modalVisible.value = false
@@ -260,7 +350,12 @@ async function handleTest(record) {
     const res = await llmConfigApi.test(record.id)
     const ok = res?.success ?? res?.ok ?? res?.status === 'ok'
     if (ok || res === true) {
-      message.success(`配置 [${record.name}] 连通性测试通过`)
+      // 若后端降级使用了默认参数，给出提示
+      if (res?.fallback) {
+        message.warning(`配置 [${record.name}] ${res.message || '已自动降级为模型默认参数'}`)
+      } else {
+        message.success(`配置 [${record.name}] 连通性测试通过`)
+      }
     } else {
       message.warning(`测试完成：${res?.message || res?.error || '未返回详细信息'}`)
     }
@@ -271,7 +366,19 @@ async function handleTest(record) {
   }
 }
 
-onMounted(() => {
+async function fetchProviderParams() {
+  try {
+    const data = await llmConfigApi.getProviderParams()
+    providerParams.value = data || {}
+  } catch (e) {
+    // 如果接口不可用，使用默认空配置
+    console.warn('获取提供商参数配置失败，使用默认配置')
+    providerParams.value = {}
+  }
+}
+
+onMounted(async () => {
+  await fetchProviderParams()
   fetchList()
 })
 </script>

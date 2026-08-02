@@ -1,3 +1,4 @@
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase
 
@@ -46,7 +47,7 @@ async def init_db() -> None:
     """初始化数据库连接（可用于启动健康检查）"""
     try:
         async with engine.begin() as conn:
-            await conn.execute("SELECT 1")
+            await conn.execute(text("SELECT 1"))
         logger.info("MySQL数据库连接成功")
     except Exception as e:
         logger.error(f"MySQL数据库连接失败: {e}")

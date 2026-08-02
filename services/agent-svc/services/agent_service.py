@@ -14,7 +14,7 @@
 import uuid
 from typing import Any, Optional
 
-from sqlalchemy import select, func, update
+from sqlalchemy import select, func, update, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -24,8 +24,17 @@ from common.exceptions import (
     BadRequestException,
 )
 from common.logger import get_logger
-from common.schemas import AgentCreate, AgentUpdate, AgentOut
-from domain.models import Agent, LongTermMemory, LLMConfig
+from common.schemas import (
+    AgentCreate, AgentUpdate, AgentOut,
+    AgentMCPBindingCreate, AgentMCPBindingOut,
+    AgentSkillBindingCreate, AgentSkillBindingOut,
+)
+from domain.models import (
+    Agent, LongTermMemory, LLMConfig,
+    AgentMCPBinding, MCPService, MCPTool,
+    AgentSkillBinding, Skill, SkillLevel,
+)
+from domain.skill_manager import SkillManager
 from infrastructure.db import AsyncSessionLocal
 
 logger = get_logger(__name__)
@@ -42,7 +51,7 @@ VALID_TRANSITIONS: dict[str, tuple[set[str], str]] = {
 }
 
 
-# 5 个官方 Agent 定义
+# 6 个官方 Agent 定义
 OFFICIAL_AGENTS: list[dict[str, Any]] = [
     {
         "name": "编程助手",
@@ -97,6 +106,26 @@ OFFICIAL_AGENTS: list[dict[str, Any]] = [
         "memory_strategy": "standard",
         "config": {"category": "chatbi", "icon": "chart"},
     },
+    {
+        "name": "提示词工程专家",
+        "description": "官方提示词工程专家 - 系统提示词润色、优化、专业化",
+        "system_prompt": (
+            "你是一位世界级的提示词工程专家（Prompt Engineering Expert），"
+            "精通大语言模型的行为机制和提示词优化技术。\n\n"
+            "你的职责是：接收用户提供的原始系统提示词草案，将其润色为"
+            "专业、结构化、高效的系统提示词。\n\n"
+            "润色原则：\n"
+            "1. **角色定义清晰**：明确 Agent 的身份、专业领域和核心能力\n"
+            "2. **行为约束精确**：规定 Agent 应该做什么、不应该做什么\n"
+            "3. **输出格式规范**：指定输出的结构、格式和风格\n"
+            "4. **边界条件明确**：处理边缘情况和异常输入的策略\n"
+            "5. **语言简洁有力**：避免冗余，使用祈使句和肯定表述\n"
+            "6. **保留用户意图**：不改变用户的核心需求，仅做专业化提升\n\n"
+            "输出要求：直接输出润色后的系统提示词，不要附加解释说明。"
+        ),
+        "memory_strategy": "standard",
+        "config": {"category": "prompt_engineering", "icon": "bulb", "is_prompt_polisher": True},
+    },
 ]
 
 
@@ -148,6 +177,8 @@ class AgentService:
 
         await db.flush()
         logger.info(f"创建Agent: id={agent_id}, name={payload.name}")
+        # 重新查询以确保关系正确加载
+        agent = await self._get_by_id(db, agent_id)
         return await self._to_out(agent)
 
     async def list_agents(
@@ -213,6 +244,8 @@ class AgentService:
 
         await db.flush()
         logger.info(f"更新Agent: id={agent_id}")
+        # 重新查询以确保关系正确加载（特别是 llm_config_id 变更时）
+        agent = await self._get_by_id(db, agent_id)
         return await self._to_out(agent)
 
     async def delete_agent(
@@ -250,6 +283,8 @@ class AgentService:
         logger.info(
             f"Agent状态变更: id={agent_id}, {action}: {old_status} → {to_state}"
         )
+        # 重新查询以确保关系正确加载
+        agent = await self._get_by_id(db, agent_id)
         return await self._to_out(agent)
 
     # ── 克隆 ──────────────────────────────────────────
@@ -293,6 +328,8 @@ class AgentService:
         logger.info(
             f"克隆Agent: source={agent_id}, new={new_id}, name={cloned.name}"
         )
+        # 重新查询以确保关系正确加载
+        cloned = await self._get_by_id(db, new_id)
         return await self._to_out(cloned)
 
     # ── 官方 Agent ────────────────────────────────────
@@ -308,6 +345,65 @@ class AgentService:
         )
         agents = result.scalars().all()
         return [await self._to_out(a) for a in agents]
+
+    async def polish_system_prompt(
+        self, db: AsyncSession, raw_prompt: str
+    ) -> dict[str, Any]:
+        """使用提示词工程专家 Agent 润色系统提示词
+
+        查找 config 中标记了 is_prompt_polisher 的官方 Agent，
+        使用其 LLM 配置调用大模型进行润色。
+        """
+        # 查找提示词工程专家 Agent
+        result = await db.execute(
+            select(Agent)
+            .options(selectinload(Agent.llm_config))
+            .where(Agent.is_official == True)  # noqa: E712
+        )
+        agents = result.scalars().all()
+        polisher = None
+        for a in agents:
+            if a.config and a.config.get("is_prompt_polisher"):
+                polisher = a
+                break
+
+        if not polisher:
+            raise NotFoundException("未找到提示词工程专家 Agent")
+
+        if not polisher.llm_config:
+            raise ValidationException("提示词工程专家 Agent 未关联 LLM 配置")
+
+        # 构建 LLM 配置并调用
+        from domain.llm_adapter import create_llm_from_config
+        from common.utils.crypto import crypto_service
+
+        cfg = polisher.llm_config
+        config_dict = {
+            "provider": cfg.provider,
+            "model_name": cfg.model_name,
+            "api_key": cfg.api_key or "",
+            "api_base_url": cfg.api_base_url or "",
+            "temperature": 0.3,  # 低温度保证输出稳定
+            "max_tokens": 2048,
+            "top_p": 0.9,
+        }
+        adapter = await create_llm_from_config(
+            config_dict, decrypt_fn=crypto_service.decrypt
+        )
+
+        messages = [
+            {"role": "system", "content": polisher.system_prompt},
+            {"role": "user", "content": f"请润色以下系统提示词草案：\n\n{raw_prompt}"},
+        ]
+        polished = await adapter.invoke(messages)
+        logger.info(
+            f"提示词润色完成: polisher_agent={polisher.id}, "
+            f"raw_len={len(raw_prompt)}, polished_len={len(polished)}"
+        )
+        return {
+            "polished_prompt": polished.strip(),
+            "fallback": adapter.is_fallback_used,
+        }
 
     async def init_official_agents(self) -> None:
         """启动时检查并创建 5 个官方 Agent (只在表为空时创建)
@@ -325,18 +421,13 @@ class AgentService:
     async def _init_official_agents_impl(
         self, db: AsyncSession
     ) -> None:
-        # 只在表为空(无官方Agent)时创建
-        count_result = await db.execute(
-            select(func.count(Agent.id)).where(
+        # 查询已存在的官方 Agent 名称集合
+        existing_result = await db.execute(
+            select(Agent.name).where(
                 Agent.is_official == True  # noqa: E712
             )
         )
-        existing_count = count_result.scalar() or 0
-        if existing_count > 0:
-            logger.info(
-                f"已存在 {existing_count} 个官方Agent, 跳过初始化"
-            )
-            return
+        existing_names = set(existing_result.scalars().all())
 
         # 获取默认 LLM 配置
         default_cfg_result = await db.execute(
@@ -369,15 +460,34 @@ class AgentService:
             await db.flush()
             logger.info("初始化时创建默认LLM配置 (占位, 请补充 api_key)")
 
-        # 创建 5 个官方 Agent
+        created_count = 0
+        skipped_count = 0
+
+        # 增量创建：已存在的跳过，不存在的创建
         for agent_def in OFFICIAL_AGENTS:
+            if agent_def["name"] in existing_names:
+                skipped_count += 1
+                continue
+
+            # 提示词工程专家尝试匹配 deepseek 的 LLM 配置
+            agent_cfg = default_cfg
+            if agent_def["config"].get("is_prompt_polisher"):
+                ds_result = await db.execute(
+                    select(LLMConfig).where(
+                        LLMConfig.model_name.like("%deepseek%")
+                    ).limit(1)
+                )
+                ds_cfg = ds_result.scalar_one_or_none()
+                if ds_cfg:
+                    agent_cfg = ds_cfg
+
             agent_id = uuid.uuid4().hex
             agent = Agent(
                 id=agent_id,
                 name=agent_def["name"],
                 description=agent_def["description"],
                 system_prompt=agent_def["system_prompt"],
-                llm_config_id=default_cfg.id,
+                llm_config_id=agent_cfg.id,
                 status="created",
                 is_official=True,
                 temperature=0.7,
@@ -387,6 +497,7 @@ class AgentService:
                 config=agent_def["config"],
             )
             db.add(agent)
+            created_count += 1
 
             # 1:1 长期记忆
             memory = LongTermMemory(
@@ -402,8 +513,7 @@ class AgentService:
 
         await db.flush()
         logger.info(
-            f"初始化完成: 创建 {len(OFFICIAL_AGENTS)} 个官方Agent "
-            f"(编程/绘图/文档/RAG/ChatBI)"
+            f"官方Agent初始化: 新增 {created_count} 个, 跳过 {skipped_count} 个"
         )
 
     # ── 内部工具 ──────────────────────────────────────
@@ -445,6 +555,331 @@ class AgentService:
             created_at=agent.created_at,
             updated_at=agent.updated_at,
         )
+
+    # ── MCP 绑定 ──────────────────────────────────────
+
+    async def list_mcp_bindings(
+        self, db: AsyncSession, agent_id: str
+    ) -> list[AgentMCPBindingOut]:
+        await self._get_by_id(db, agent_id)
+        stmt = (
+            select(AgentMCPBinding, MCPService)
+            .join(MCPService, AgentMCPBinding.mcp_service_id == MCPService.id)
+            .where(AgentMCPBinding.agent_id == agent_id)
+            .order_by(AgentMCPBinding.created_at.desc())
+        )
+        result = await db.execute(stmt)
+        rows = result.all()
+        items: list[AgentMCPBindingOut] = []
+        for binding, mcp in rows:
+            items.append(AgentMCPBindingOut(
+                id=binding.id,
+                agent_id=binding.agent_id,
+                mcp_service_id=binding.mcp_service_id,
+                mcp_service_name=mcp.name or "",
+                mcp_service_mode=mcp.mode or "",
+                mcp_service_status=mcp.status or "",
+                config=binding.config or {},
+                enabled=bool(binding.enabled),
+                created_at=binding.created_at,
+            ))
+        return items
+
+    async def bind_mcp(
+        self, db: AsyncSession, agent_id: str, payload: AgentMCPBindingCreate
+    ) -> AgentMCPBindingOut:
+        await self._get_by_id(db, agent_id)
+        mcp_result = await db.execute(
+            select(MCPService).where(MCPService.id == payload.mcp_service_id)
+        )
+        mcp = mcp_result.scalar_one_or_none()
+        if not mcp:
+            raise ValidationException(
+                f"MCP服务不存在: {payload.mcp_service_id}"
+            )
+        exist_result = await db.execute(
+            select(AgentMCPBinding).where(
+                AgentMCPBinding.agent_id == agent_id,
+                AgentMCPBinding.mcp_service_id == payload.mcp_service_id,
+            )
+        )
+        if exist_result.scalar_one_or_none():
+            raise ValidationException(
+                f"该MCP服务已绑定: agent_id={agent_id}, "
+                f"mcp_service_id={payload.mcp_service_id}"
+            )
+        binding = AgentMCPBinding(
+            id=uuid.uuid4().hex,
+            agent_id=agent_id,
+            mcp_service_id=payload.mcp_service_id,
+            config=payload.config or {},
+            enabled=payload.enabled if payload.enabled is not None else True,
+        )
+        db.add(binding)
+        await db.flush()
+        logger.info(
+            f"Agent绑定MCP: agent_id={agent_id}, "
+            f"mcp_service_id={payload.mcp_service_id}"
+        )
+        return AgentMCPBindingOut(
+            id=binding.id,
+            agent_id=binding.agent_id,
+            mcp_service_id=binding.mcp_service_id,
+            mcp_service_name=mcp.name or "",
+            mcp_service_mode=mcp.mode or "",
+            mcp_service_status=mcp.status or "",
+            config=binding.config or {},
+            enabled=bool(binding.enabled),
+            created_at=binding.created_at,
+        )
+
+    async def unbind_mcp(
+        self, db: AsyncSession, agent_id: str, mcp_service_id: str
+    ) -> None:
+        await self._get_by_id(db, agent_id)
+        result = await db.execute(
+            select(AgentMCPBinding).where(
+                AgentMCPBinding.agent_id == agent_id,
+                AgentMCPBinding.mcp_service_id == mcp_service_id,
+            )
+        )
+        binding = result.scalar_one_or_none()
+        if not binding:
+            raise NotFoundException(
+                f"MCP绑定不存在: agent_id={agent_id}, "
+                f"mcp_service_id={mcp_service_id}"
+            )
+        await db.delete(binding)
+        await db.flush()
+        logger.info(
+            f"Agent解绑MCP: agent_id={agent_id}, "
+            f"mcp_service_id={mcp_service_id}"
+        )
+
+    # ── Skill 绑定 ────────────────────────────────────
+
+    async def list_skill_bindings(
+        self, db: AsyncSession, agent_id: str
+    ) -> list[AgentSkillBindingOut]:
+        await self._get_by_id(db, agent_id)
+        stmt = (
+            select(AgentSkillBinding, Skill)
+            .join(Skill, AgentSkillBinding.skill_id == Skill.id)
+            .where(AgentSkillBinding.agent_id == agent_id)
+            .order_by(AgentSkillBinding.priority.desc(),
+                      AgentSkillBinding.created_at.desc())
+        )
+        result = await db.execute(stmt)
+        rows = result.all()
+        items: list[AgentSkillBindingOut] = []
+        for binding, skill in rows:
+            items.append(AgentSkillBindingOut(
+                id=binding.id,
+                agent_id=binding.agent_id,
+                skill_id=binding.skill_id,
+                skill_name=skill.name or "",
+                skill_category=skill.category or "",
+                skill_source=skill.source or "",
+                priority=binding.priority or 0,
+                enabled=bool(binding.enabled),
+                created_at=binding.created_at,
+            ))
+        return items
+
+    async def bind_skill(
+        self, db: AsyncSession, agent_id: str, payload: AgentSkillBindingCreate
+    ) -> AgentSkillBindingOut:
+        await self._get_by_id(db, agent_id)
+        skill_result = await db.execute(
+            select(Skill).where(Skill.id == payload.skill_id)
+        )
+        skill = skill_result.scalar_one_or_none()
+        if not skill:
+            raise ValidationException(
+                f"Skill不存在: {payload.skill_id}"
+            )
+        exist_result = await db.execute(
+            select(AgentSkillBinding).where(
+                AgentSkillBinding.agent_id == agent_id,
+                AgentSkillBinding.skill_id == payload.skill_id,
+            )
+        )
+        if exist_result.scalar_one_or_none():
+            raise ValidationException(
+                f"该Skill已绑定: agent_id={agent_id}, "
+                f"skill_id={payload.skill_id}"
+            )
+        binding = AgentSkillBinding(
+            id=uuid.uuid4().hex,
+            agent_id=agent_id,
+            skill_id=payload.skill_id,
+            priority=payload.priority or 0,
+            enabled=payload.enabled if payload.enabled is not None else True,
+        )
+        db.add(binding)
+        await db.flush()
+        logger.info(
+            f"Agent绑定Skill: agent_id={agent_id}, "
+            f"skill_id={payload.skill_id}"
+        )
+        return AgentSkillBindingOut(
+            id=binding.id,
+            agent_id=binding.agent_id,
+            skill_id=binding.skill_id,
+            skill_name=skill.name or "",
+            skill_category=skill.category or "",
+            skill_source=skill.source or "",
+            priority=binding.priority or 0,
+            enabled=bool(binding.enabled),
+            created_at=binding.created_at,
+        )
+
+    async def unbind_skill(
+        self, db: AsyncSession, agent_id: str, skill_id: str
+    ) -> None:
+        await self._get_by_id(db, agent_id)
+        result = await db.execute(
+            select(AgentSkillBinding).where(
+                AgentSkillBinding.agent_id == agent_id,
+                AgentSkillBinding.skill_id == skill_id,
+            )
+        )
+        binding = result.scalar_one_or_none()
+        if not binding:
+            raise NotFoundException(
+                f"Skill绑定不存在: agent_id={agent_id}, "
+                f"skill_id={skill_id}"
+            )
+        await db.delete(binding)
+        await db.flush()
+        logger.info(
+            f"Agent解绑Skill: agent_id={agent_id}, "
+            f"skill_id={skill_id}"
+        )
+
+    # ── 工具汇总（供 chat-svc 对话前加载） ──────────
+
+    async def get_agent_tools_summary(
+        self, db: AsyncSession, agent_id: str
+    ) -> dict[str, Any]:
+        await self._get_by_id(db, agent_id)
+
+        # 查询 MCP 绑定 (enabled=True) 及其 enabled tools
+        mcp_stmt = (
+            select(AgentMCPBinding, MCPService)
+            .join(MCPService, AgentMCPBinding.mcp_service_id == MCPService.id)
+            .where(
+                AgentMCPBinding.agent_id == agent_id,
+                AgentMCPBinding.enabled == True,  # noqa: E712
+            )
+        )
+        mcp_rows = (await db.execute(mcp_stmt)).all()
+
+        mcp_service_ids = [
+            mcp.id for _, mcp in mcp_rows
+        ]
+        tools_by_mcp: dict[str, list[dict]] = {}
+        if mcp_service_ids:
+            tool_stmt = (
+                select(MCPTool)
+                .where(
+                    MCPTool.mcp_service_id.in_(mcp_service_ids),
+                    MCPTool.enabled == True,  # noqa: E712
+                )
+            )
+            tool_rows = (await db.execute(tool_stmt)).scalars().all()
+            for t in tool_rows:
+                mid = t.mcp_service_id
+                if mid not in tools_by_mcp:
+                    tools_by_mcp[mid] = []
+                tools_by_mcp[mid].append({
+                    "name": t.name,
+                    "description": t.description or "",
+                    "input_schema": t.input_schema or {},
+                })
+
+        mcp_services: list[dict] = []
+        for binding, mcp in mcp_rows:
+            mcp_services.append({
+                "id": mcp.id,
+                "name": mcp.name or "",
+                "mode": mcp.mode or "",
+                "status": mcp.status or "",
+                "tools": tools_by_mcp.get(mcp.id, []),
+            })
+
+        # 查询 Skill 绑定 (enabled=True) 及其 Level0 概要
+        skill_stmt = (
+            select(AgentSkillBinding, Skill)
+            .join(Skill, AgentSkillBinding.skill_id == Skill.id)
+            .where(
+                AgentSkillBinding.agent_id == agent_id,
+                AgentSkillBinding.enabled == True,  # noqa: E712
+                Skill.enabled == True,  # noqa: E712
+            )
+            .order_by(AgentSkillBinding.priority.desc())
+        )
+        skill_rows = (await db.execute(skill_stmt)).all()
+
+        skill_ids = [s.id for _, s in skill_rows]
+        levels_by_skill: dict[str, list] = {}
+        if skill_ids:
+            level_stmt = (
+                select(SkillLevel)
+                .where(SkillLevel.skill_id.in_(skill_ids))
+                .order_by(SkillLevel.level.asc())
+            )
+            level_rows = (await db.execute(level_stmt)).scalars().all()
+            for lv in level_rows:
+                sid = lv.skill_id
+                if sid not in levels_by_skill:
+                    levels_by_skill[sid] = []
+                levels_by_skill[sid].append({
+                    "level": lv.level,
+                    "name": lv.name or "",
+                    "content": lv.content or "",
+                    "token_count": lv.token_count or 0,
+                })
+
+        skills: list[dict] = []
+        for binding, skill in skill_rows:
+            levels_data = levels_by_skill.get(skill.id, [])
+            skill_dicts = [
+                {
+                    "id": skill.id,
+                    "name": skill.name or "",
+                    "description": skill.description or "",
+                    "category": skill.category or "",
+                    "tags": skill.tags or [],
+                    "version": skill.version or "",
+                }
+            ]
+            level0_summary = SkillManager.build_skill_prompt_level0(skill_dicts)
+            skills.append({
+                "id": skill.id,
+                "name": skill.name or "",
+                "description": skill.description or "",
+                "category": skill.category or "",
+                "source": skill.source or "",
+                "priority": binding.priority or 0,
+                "level0_summary": level0_summary,
+                "has_level1": any(l["level"] == 1 for l in levels_data),
+                "has_level2": any(l["level"] == 2 for l in levels_data),
+            })
+
+        summary = {
+            "agent_id": agent_id,
+            "mcp_services": mcp_services,
+            "skills": skills,
+            "mcp_tool_count": sum(len(m["tools"]) for m in mcp_services),
+            "skill_count": len(skills),
+        }
+        logger.info(
+            f"Agent工具汇总: agent_id={agent_id}, "
+            f"mcp={len(mcp_services)}个(tools={summary['mcp_tool_count']}), "
+            f"skills={len(skills)}个"
+        )
+        return summary
 
 
 agent_service = AgentService()

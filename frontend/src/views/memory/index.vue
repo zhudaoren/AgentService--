@@ -271,7 +271,7 @@ function roleColor(m) {
 async function fetchAgents() {
   agentLoading.value = true
   try {
-    const res = await agentApi.list({ page: 1, page_size: 200 })
+    const res = await agentApi.list({ page: 1, page_size: 100 })
     agents.value = Array.isArray(res) ? res : res?.items || res?.list || res?.data || []
   } catch (e) {
   } finally {

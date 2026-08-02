@@ -12,13 +12,14 @@ from common.schemas import (
     LLMConfigUpdate,
     LLMConfigOut,
 )
+from domain.llm_adapter import LLMAdapter
 from infrastructure.db import get_db
 from services.llm_service import llm_service
 
 llm_router = APIRouter()
 
 
-@llm_router.post("/", response_model=ApiResponse)
+@llm_router.post("", response_model=ApiResponse)
 async def create_config(
     payload: LLMConfigCreate,
     db: AsyncSession = Depends(get_db),
@@ -28,7 +29,7 @@ async def create_config(
     return ApiResponse(data=config.model_dump())
 
 
-@llm_router.get("/", response_model=ApiResponse)
+@llm_router.get("", response_model=ApiResponse)
 async def list_configs(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
@@ -70,6 +71,21 @@ async def delete_config(
     """删除LLM配置"""
     await llm_service.delete_config(db, config_id)
     return ApiResponse(message="删除成功")
+
+
+@llm_router.get("/providers/params", response_model=ApiResponse)
+async def get_provider_params():
+    """获取各提供商支持的参数列表（用于前端动态展示配置项）
+    
+    Returns:
+        {
+            "openai": ["temperature", "max_tokens", "top_p"],
+            "claude": ["temperature", "max_tokens", "top_p"],
+            ...
+        }
+    """
+    params_info = LLMAdapter.get_provider_params_info()
+    return ApiResponse(data=params_info)
 
 
 @llm_router.post("/{config_id}/test", response_model=ApiResponse)

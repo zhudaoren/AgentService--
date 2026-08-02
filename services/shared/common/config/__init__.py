@@ -15,7 +15,7 @@ class Settings(BaseSettings):
     MYSQL_HOST: str = Field(default="localhost", env="MYSQL_HOST")
     MYSQL_PORT: int = Field(default=3306, env="MYSQL_PORT")
     MYSQL_USER: str = Field(default="root", env="MYSQL_USER")
-    MYSQL_PASSWORD: str = Field(default="root123", env="MYSQL_PASSWORD")
+    MYSQL_PASSWORD: str = Field(default="root", env="MYSQL_PASSWORD")
     MYSQL_DATABASE: str = Field(default="agent_service", env="MYSQL_DATABASE")
 
     REDIS_HOST: str = Field(default="localhost", env="REDIS_HOST")

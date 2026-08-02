@@ -1,4 +1,4 @@
-"""对话路由 - 会话 CRUD + 流式/非流式对话 + 停止生成
+"""对话路由 - 会话 CRUD + 流式/非流式对话 + 停止生成 + (P2)重新生成 + 工具调用查询
 
 所有响应用 ApiResponse 包装。
 路径顺序: /conversations 列表 / /chat / /chat/stop 必须在 /conversations/{conv_id} 之前。
@@ -98,6 +98,43 @@ async def get_messages(
         page_size=page_size,
     )
     return ApiResponse(data=page_data.model_dump())
+
+
+# ── (P2) 重新生成最后一条消息 ─────────────────────────
+@chat_router.post("/conversations/{conv_id}/regenerate")
+async def regenerate_last_message(conv_id: str):
+    """重新生成最后一条 assistant 消息（SSE 流式）
+
+    1. 删除最后一条 assistant + 其后的 tool_call/tool_result 消息
+    2. 以对应 user 消息 content 重新调用 chat 流式生成
+    """
+    return StreamingResponse(
+        chat_service.regenerate_last_message(conv_id),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+# ── (P2) 查询某条消息下的工具调用 ────────────────────
+@chat_router.get(
+    "/conversations/{conv_id}/messages/{message_id}/tool-calls",
+    response_model=ApiResponse,
+)
+async def get_message_tool_calls(
+    conv_id: str,
+    message_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """查询某条消息下的工具调用记录
+
+    优先读取消息自身 tool_calls 字段；若为空，则回溯其后的 tool_call/tool_result 消息。
+    """
+    result = await chat_service.get_message_tool_calls(db, conv_id, message_id)
+    return ApiResponse(data=result)
 
 
 # ── 对话 ──────────────────────────────────────────────

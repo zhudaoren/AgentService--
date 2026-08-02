@@ -57,6 +57,7 @@ export const llmConfigApi = {
   update: (id, data) => request.put(`/llm-configs/${id}`, data),
   remove: (id) => request.delete(`/llm-configs/${id}`),
   test: (id) => request.post(`/llm-configs/${id}/test`),
+  getProviderParams: () => request.get('/llm-configs/providers/params'),
 }
 
 // ============ Agent ============
@@ -69,6 +70,7 @@ export const agentApi = {
   status: (id, action) => request.post(`/agents/${id}/status`, { action }),
   clone: (id) => request.post(`/agents/${id}/clone`),
   official: (params) => request.get('/agents/official/list', { params }),
+  polishPrompt: (raw_prompt) => request.post('/agents/polish-prompt', { raw_prompt }),
 }
 
 // ============ 会话 ============
@@ -176,6 +178,144 @@ export const memoryApi = {
   summary: (agentId) => request.get(`/memory/agents/${agentId}/long-term/summary`),
   shortTerm: (agentId, conversationId) =>
     request.get(`/memory/agents/${agentId}/short-term/${conversationId}`),
+}
+
+// ============ MCP 服务 ============
+export const mcpApi = {
+  list: (params) => request.get('/mcp-services', { params }),
+  create: (data) => request.post('/mcp-services', data),
+  detail: (id) => request.get(`/mcp-services/${encodeURIComponent(id)}`),
+  update: (id, data) => request.put(`/mcp-services/${encodeURIComponent(id)}`, data),
+  remove: (id) => request.delete(`/mcp-services/${encodeURIComponent(id)}`),
+  connect: (id) => request.post(`/mcp-services/${encodeURIComponent(id)}/connect`),
+  disconnect: (id) => request.post(`/mcp-services/${encodeURIComponent(id)}/disconnect`),
+  discover: (id) => request.post(`/mcp-services/${encodeURIComponent(id)}/discover`),
+  listTools: (id, params) => request.get(`/mcp-services/${encodeURIComponent(id)}/tools`, { params }),
+  toggleTool: (id, toolName, enabled) =>
+    request.post(
+      `/mcp-services/${encodeURIComponent(id)}/tools/${encodeURIComponent(toolName)}/toggle`,
+      { enabled }
+    ),
+}
+
+// ============ 工具调用 ============
+export const toolApi = {
+  call: (data) => request.post('/tools/call', data),
+  callLogs: (params) => request.get('/tool-call-logs', { params }),
+}
+
+// ============ Skill 管理 ============
+export const skillApi = {
+  list: (params) => request.get('/skills', { params }),
+  create: (data) => request.post('/skills', data),
+  detail: (id) => request.get(`/skills/${encodeURIComponent(id)}`),
+  update: (id, data) => request.put(`/skills/${encodeURIComponent(id)}`, data),
+  remove: (id) => request.delete(`/skills/${encodeURIComponent(id)}`),
+  toggle: (id, enabled) =>
+    request.post(`/skills/${encodeURIComponent(id)}/toggle`, { enabled }),
+  levels: (id) => request.get(`/skills/${encodeURIComponent(id)}/levels`),
+  importLocal: (formData) =>
+    request.post('/skills/import/local', formData, {
+      headers: { 'Content-Type': 'multipart/form-data' },
+    }),
+  importOnline: (data) => request.post('/skills/import/online', data),
+  progressive: (id, level) =>
+    request.get(`/skills/${encodeURIComponent(id)}/progressive`, { params: { level } }),
+}
+
+// ============ Agent 绑定 ============
+export const agentBindingApi = {
+  getMCPBindings: (agentId) =>
+    request.get(`/agents/${encodeURIComponent(agentId)}/mcp-bindings`),
+  bindMCP: (agentId, data) =>
+    request.post(`/agents/${encodeURIComponent(agentId)}/mcp-bindings`, data),
+  unbindMCP: (agentId, mcpServiceId) =>
+    request.delete(
+      `/agents/${encodeURIComponent(agentId)}/mcp-bindings/${encodeURIComponent(mcpServiceId)}`
+    ),
+  getSkillBindings: (agentId) =>
+    request.get(`/agents/${encodeURIComponent(agentId)}/skill-bindings`),
+  bindSkill: (agentId, data) =>
+    request.post(`/agents/${encodeURIComponent(agentId)}/skill-bindings`, data),
+  unbindSkill: (agentId, skillId) =>
+    request.delete(
+      `/agents/${encodeURIComponent(agentId)}/skill-bindings/${encodeURIComponent(skillId)}`
+    ),
+  getToolsSummary: (agentId) =>
+    request.get(`/agents/${encodeURIComponent(agentId)}/tools-summary`),
+}
+
+// chatApi 补充 regenerate 方法
+chatApi.regenerate = (payload, handlers = {}) => {
+  const controller = new AbortController()
+  const { onMessage, onDone, onError } = handlers
+
+  ;(async () => {
+    try {
+      const response = await fetch('/api/chat/regenerate', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ ...payload, stream: true }),
+        signal: controller.signal,
+      })
+
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`)
+      }
+
+      const reader = response.body.getReader()
+      const decoder = new TextDecoder('utf-8')
+      let buffer = ''
+
+      while (true) {
+        const { done, value } = await reader.read()
+        if (done) break
+        buffer += decoder.decode(value, { stream: true })
+        const parts = buffer.split('\n')
+        buffer = parts.pop()
+        for (const line of parts) {
+          const trimmed = line.trim()
+          if (!trimmed || !trimmed.startsWith('data:')) continue
+          const jsonStr = trimmed.replace(/^data:\s*/, '')
+          if (jsonStr === '[DONE]') {
+            onDone && onDone({})
+            return
+          }
+          try {
+            const data = JSON.parse(jsonStr)
+            if (data.done) {
+              onDone && onDone(data)
+              return
+            }
+            if (data.content || data.type) {
+              onMessage && onMessage(data)
+            }
+          } catch (e) {}
+        }
+      }
+      if (buffer.startsWith('data:')) {
+        try {
+          const data = JSON.parse(buffer.replace(/^data:\s*/, ''))
+          if (data.done) {
+            onDone && onDone(data)
+          } else if (data.content || data.type) {
+            onMessage && onMessage(data)
+          }
+        } catch (e) {}
+      }
+      onDone && onDone({})
+    } catch (err) {
+      if (err.name === 'AbortError') {
+        onDone && onDone({ aborted: true })
+        return
+      }
+      onError && onError(err)
+    }
+  })()
+
+  return controller
 }
 
 export default request

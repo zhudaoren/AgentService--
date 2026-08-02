@@ -1,6 +1,6 @@
 # ============================================================
 # AgentService平台 - Docker Compose 部署文件
-# 版本: v3.0
+# 版本: v3.0 (Phase 2)
 # ============================================================
 
 version: "3.8"
@@ -13,7 +13,7 @@ services:
 
   mysql:
     image: mysql:8.0
-    container_name: agent-service-mysql
+    container_name: agent-mysql
     environment:
       MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root123}
       MYSQL_DATABASE: ${MYSQL_DATABASE:-agent_service}
@@ -21,11 +21,11 @@ services:
     ports:
       - "${MYSQL_PORT:-3306}:3306"
     volumes:
-      - mysql_data:/var/lib/mysql
+      - mysql-data:/var/lib/mysql
       - ./infra/mysql/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
     command: --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci --default-authentication-plugin=mysql_native_password
     networks:
-      - agent-service-network
+      - agent-net
     healthcheck:
       test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-p${MYSQL_ROOT_PASSWORD:-root123}"]
       interval: 10s
@@ -34,83 +34,103 @@ services:
 
   redis:
     image: redis:7-alpine
-    container_name: agent-service-redis
+    container_name: agent-redis
     ports:
-      - "${REDIS_PORT:-6379}:6379"
-    volumes:
-      - redis_data:/data
+      - "6379:6379"
     command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:-}
+    volumes:
+      - redis-data:/data
     networks:
-      - agent-service-network
+      - agent-net
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
       timeout: 5s
       retries: 5
 
-  etcd:
-    image: quay.io/coreos/etcd:v3.5.5
-    container_name: agent-service-etcd
-    environment:
-      - ETCD_AUTO_COMPACTION_MODE=revision
-      - ETCD_AUTO_COMPACTION_RETENTION=1000
-      - ETCD_QUOTA_BACKEND_BYTES=4294967296
-    command: etcd -advertise-client-urls=http://127.0.0.1:2379 -listen-client-urls http://0.0.0.0:2379 --data-dir /etcd
-    volumes:
-      - etcd_data:/etcd
-    networks:
-      - agent-service-network
-    healthcheck:
-      test: ["CMD", "etcdctl", "endpoint", "health"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-
   minio:
-    image: minio/minio:RELEASE.2023-09-30T07-02-29Z
-    container_name: agent-service-minio
+    image: minio/minio:RELEASE.2024-01-01T00-00-00Z
+    container_name: agent-minio
+    ports:
+      - "9000:9000"
+      - "9001:9001"
     environment:
       MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:-minioadmin}
       MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-minioadmin}
-    ports:
-      - "${MINIO_PORT:-9000}:9000"
-      - "${MINIO_CONSOLE_PORT:-9001}:9001"
-    volumes:
-      - minio_data:/data
     command: server /data --console-address ":9001"
+    volumes:
+      - minio-data:/data
     networks:
-      - agent-service-network
+      - agent-net
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
       interval: 10s
       timeout: 5s
       retries: 5
 
-  # Milvus 暂时注释，等需要RAG时再启用
-  # milvus:
-  #   image: milvusdb/milvus:v2.4.0
-  #   container_name: agent-service-milvus
-  #   environment:
-  #     ETCD_ENDPOINTS: etcd:2379
-  #   command: ["milvus", "run", "standalone"]
-  #   ports:
-  #     - "${MILVUS_PORT:-19530}:19530"
-  #     - "9091:9091"
-  #   volumes:
-  #     - milvus_data:/var/lib/milvus
-  #   depends_on:
-  #     - etcd
-  #   networks:
-  #     - agent-service-network
-  #   healthcheck:
-  #     test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
-  #     interval: 10s
-  #     timeout: 5s
-  #     retries: 5
+  milvus-etcd:
+    image: quay.io/coreos/etcd:v3.5.5
+    container_name: agent-milvus-etcd
+    environment:
+      - ETCD_AUTO_COMPACTION_MODE=revision
+      - ETCD_AUTO_COMPACTION_RETENTION=1000
+      - ETCD_QUOTA_BACKEND_BYTES=4294967296
+    command: etcd -advertise-client-urls=http://127.0.0.1:2379 -listen-client-urls http://0.0.0.0:2379 --data-dir /etcd
+    volumes:
+      - milvus-etcd-data:/etcd
+    networks:
+      - agent-net
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  milvus-minio:
+    image: minio/minio:RELEASE.2023-03-20T20-16-18Z
+    container_name: agent-milvus-minio
+    environment:
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+    command: minio server /minio_data --console-address ":9001"
+    volumes:
+      - milvus-minio-data:/minio_data
+    networks:
+      - agent-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  milvus-standalone:
+    image: milvusdb/milvus:v2.4.0
+    container_name: agent-milvus
+    command: ["milvus", "run", "standalone"]
+    environment:
+      ETCD_ENDPOINTS: milvus-etcd:2379
+      MINIO_ADDRESS: milvus-minio:9000
+    ports:
+      - "19530:19530"
+      - "9091:9091"
+    volumes:
+      - milvus-data:/var/lib/milvus
+    depends_on:
+      milvus-etcd:
+        condition: service_healthy
+      milvus-minio:
+        condition: service_healthy
+    networks:
+      - agent-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
   rabbitmq:
     image: rabbitmq:3.12-management-alpine
-    container_name: agent-service-rabbitmq
+    container_name: agent-rabbitmq
     environment:
       RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-guest}
       RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-guest}
@@ -118,9 +138,9 @@ services:
       - "${RABBITMQ_PORT:-5672}:5672"
       - "${RABBITMQ_MGMT_PORT:-15672}:15672"
     volumes:
-      - rabbitmq_data:/var/lib/rabbitmq
+      - rabbitmq-data:/var/lib/rabbitmq
     networks:
-      - agent-service-network
+      - agent-net
     healthcheck:
       test: ["CMD", "rabbitmq-diagnostics", "ping"]
       interval: 10s
@@ -128,14 +148,36 @@ services:
       retries: 5
 
   # ============================================================
-  # 微服务 (Phase 0: 仅启动agent-svc和chat-svc做验证)
+  # 微服务
   # ============================================================
+
+  gateway:
+    build:
+      context: ./services
+      dockerfile: gateway/Dockerfile
+    container_name: agent-gateway
+    environment:
+      - APP_ENV=docker
+      - MYSQL_HOST=mysql
+      - MYSQL_PORT=3306
+      - MYSQL_USER=root
+      - MYSQL_PASSWORD=${MYSQL_ROOT_PASSWORD:-root123}
+      - MYSQL_DATABASE=${MYSQL_DATABASE:-agent_service}
+      - LOG_LEVEL=info
+    ports:
+      - "8000:8000"
+    depends_on:
+      - mysql
+      - redis
+    networks:
+      - agent-net
+    restart: unless-stopped
 
   agent-svc:
     build:
       context: ./services
       dockerfile: agent-svc/Dockerfile
-    container_name: agent-service-agent
+    container_name: agent-svc
     environment:
       - APP_ENV=docker
       - MYSQL_HOST=mysql
@@ -150,19 +192,17 @@ services:
     ports:
       - "8001:8001"
     depends_on:
-      mysql:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
+      - mysql
+      - redis
     networks:
-      - agent-service-network
+      - agent-net
     restart: unless-stopped
 
   chat-svc:
     build:
       context: ./services
       dockerfile: chat-svc/Dockerfile
-    container_name: agent-service-chat
+    container_name: agent-chat-svc
     environment:
       - APP_ENV=docker
       - MYSQL_HOST=mysql
@@ -177,49 +217,34 @@ services:
     ports:
       - "8002:8002"
     depends_on:
-      mysql:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
+      - mysql
+      - redis
     networks:
-      - agent-service-network
+      - agent-net
     restart: unless-stopped
 
   tool-svc:
-    build:
-      context: ./services
-      dockerfile: tool-svc/Dockerfile
-    container_name: agent-service-tool
-    environment:
-      - APP_ENV=docker
-      - MYSQL_HOST=mysql
-      - MYSQL_PORT=3306
-      - MYSQL_USER=root
-      - MYSQL_PASSWORD=${MYSQL_ROOT_PASSWORD:-root123}
-      - MYSQL_DATABASE=${MYSQL_DATABASE:-agent_service}
-      - REDIS_HOST=redis
-      - REDIS_PORT=6379
-      - REDIS_PASSWORD=${REDIS_PASSWORD:-}
-      - MINIO_ENDPOINT=minio:9000
-      - MINIO_ACCESS_KEY=${MINIO_ACCESS_KEY:-minioadmin}
-      - MINIO_SECRET_KEY=${MINIO_SECRET_KEY:-minioadmin}
-      - LOG_LEVEL=info
+    build: ./services/tool-svc
+    container_name: agent-tool-svc
     ports:
       - "8003:8003"
+    env_file: .env
     depends_on:
-      mysql:
-        condition: service_healthy
-      minio:
-        condition: service_healthy
+      - mysql
+      - redis
+      - minio
+    volumes:
+      - "./data/skills_uploads:/app/data/skills_uploads"
+      - "./services/shared:/app/shared"
     networks:
-      - agent-service-network
+      - agent-net
     restart: unless-stopped
 
   mem-svc:
     build:
       context: ./services
       dockerfile: mem-svc/Dockerfile
-    container_name: agent-service-mem
+    container_name: agent-mem-svc
     environment:
       - APP_ENV=docker
       - MYSQL_HOST=mysql
@@ -230,23 +255,23 @@ services:
       - REDIS_HOST=redis
       - REDIS_PORT=6379
       - REDIS_PASSWORD=${REDIS_PASSWORD:-}
+      - MILVUS_HOST=milvus-standalone
+      - MILVUS_PORT=19530
       - LOG_LEVEL=info
     ports:
       - "8004:8004"
     depends_on:
-      mysql:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
+      - mysql
+      - redis
     networks:
-      - agent-service-network
+      - agent-net
     restart: unless-stopped
 
   rag-svc:
     build:
       context: ./services
       dockerfile: rag-svc/Dockerfile
-    container_name: agent-service-rag
+    container_name: agent-rag-svc
     environment:
       - APP_ENV=docker
       - MYSQL_HOST=mysql
@@ -264,19 +289,17 @@ services:
     ports:
       - "8005:8005"
     depends_on:
-      mysql:
-        condition: service_healthy
-      minio:
-        condition: service_healthy
+      - mysql
+      - minio
     networks:
-      - agent-service-network
+      - agent-net
     restart: unless-stopped
 
   chatbi-svc:
     build:
       context: ./services
       dockerfile: chatbi-svc/Dockerfile
-    container_name: agent-service-chatbi
+    container_name: agent-chatbi-svc
     environment:
       - APP_ENV=docker
       - MYSQL_HOST=mysql
@@ -288,17 +311,16 @@ services:
     ports:
       - "8006:8006"
     depends_on:
-      mysql:
-        condition: service_healthy
+      - mysql
     networks:
-      - agent-service-network
+      - agent-net
     restart: unless-stopped
 
   coord-svc:
     build:
       context: ./services
       dockerfile: coord-svc/Dockerfile
-    container_name: agent-service-coord
+    container_name: agent-coord-svc
     environment:
       - APP_ENV=docker
       - MYSQL_HOST=mysql
@@ -310,17 +332,16 @@ services:
     ports:
       - "8007:8007"
     depends_on:
-      mysql:
-        condition: service_healthy
+      - mysql
     networks:
-      - agent-service-network
+      - agent-net
     restart: unless-stopped
 
   evo-svc:
     build:
       context: ./services
       dockerfile: evo-svc/Dockerfile
-    container_name: agent-service-evo
+    container_name: agent-evo-svc
     environment:
       - APP_ENV=docker
       - MYSQL_HOST=mysql
@@ -336,21 +357,19 @@ services:
     ports:
       - "8008:8008"
     depends_on:
-      mysql:
-        condition: service_healthy
-      rabbitmq:
-        condition: service_healthy
+      - mysql
+      - rabbitmq
     networks:
-      - agent-service-network
+      - agent-net
     restart: unless-stopped
 
   # ============================================================
-  # 前端 (Phase 0: 暂时用 nginx 占位)
+  # 前端
   # ============================================================
 
   frontend:
     image: nginx:alpine
-    container_name: agent-service-frontend
+    container_name: agent-frontend
     ports:
       - "${FRONTEND_PORT:-8080}:80"
     volumes:
@@ -358,17 +377,18 @@ services:
     depends_on:
       - agent-svc
     networks:
-      - agent-service-network
+      - agent-net
     restart: unless-stopped
 
 volumes:
-  mysql_data:
-  redis_data:
-  etcd_data:
-  minio_data:
-  milvus_data:
-  rabbitmq_data:
+  mysql-data:
+  redis-data:
+  minio-data:
+  milvus-etcd-data:
+  milvus-minio-data:
+  milvus-data:
+  rabbitmq-data:
 
 networks:
-  agent-service-network:
+  agent-net:
     driver: bridge

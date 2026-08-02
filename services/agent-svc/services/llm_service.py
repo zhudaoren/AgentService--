@@ -167,11 +167,19 @@ class LLMConfigService:
             )
             resp_text = response if isinstance(response, str) else str(response)
             logger.info(f"LLM连通性测试成功: config_id={config_id}")
-            return {
+            result = {
                 "success": True,
                 "message": "连接成功",
                 "response": resp_text[:200],
             }
+            # 若发生了参数降级，附加提示
+            if adapter.is_fallback_used:
+                result["fallback"] = True
+                result["message"] = (
+                    "连接成功（已自动降级为模型默认参数，"
+                    "当前模型不支持所配置的参数）"
+                )
+            return result
         except LLMException as e:
             logger.warning(f"LLM连通性测试失败: config_id={config_id}, err={e.message}")
             return {"success": False, "message": e.message}

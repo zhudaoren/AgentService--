@@ -140,11 +140,24 @@
           </a-select>
         </a-form-item>
         <a-form-item label="系统提示词 (System Prompt)" name="system_prompt">
-          <a-textarea
-            v-model:value="form.system_prompt"
-            :rows="5"
-            placeholder="定义 Agent 的角色、能力和行为约束"
-          />
+          <div class="prompt-wrapper">
+            <a-textarea
+              v-model:value="form.system_prompt"
+              :rows="5"
+              placeholder="定义 Agent 的角色、能力和行为约束"
+            />
+            <a-button
+              type="link"
+              size="small"
+              class="polish-btn"
+              :loading="polishing"
+              :disabled="!form.system_prompt || !form.system_prompt.trim()"
+              @click="handlePolishPrompt"
+            >
+              <thunderbolt-outlined />
+              AI 润色
+            </a-button>
+          </div>
         </a-form-item>
         <a-row :gutter="16">
           <a-col :span="8">
@@ -213,6 +226,64 @@
         </template>
       </a-list>
     </a-modal>
+    <!-- AI 润色对比弹窗 -->
+    <a-modal
+      v-model:open="polishVisible"
+      title="AI 润色系统提示词"
+      width="900px"
+      :footer="null"
+      :mask-closable="false"
+    >
+      <div class="polish-compare">
+        <a-row :gutter="16">
+          <a-col :span="12">
+            <div class="polish-panel">
+              <div class="polish-panel-header">
+                <span class="polish-panel-title">原始提示词</span>
+                <a-tag color="default">只读</a-tag>
+              </div>
+              <a-textarea
+                :value="polishOriginal"
+                :rows="16"
+                readonly
+                class="polish-textarea-readonly"
+              />
+            </div>
+          </a-col>
+          <a-col :span="12">
+            <div class="polish-panel">
+              <div class="polish-panel-header">
+                <span class="polish-panel-title">润色结果</span>
+                <a-tag color="purple">可编辑</a-tag>
+              </div>
+              <a-textarea
+                v-model:value="polishResult"
+                :rows="16"
+                placeholder="润色后的提示词将显示在这里，您可以直接编辑修改"
+              />
+            </div>
+          </a-col>
+        </a-row>
+        <div class="polish-footer">
+          <a-space>
+            <a-button
+              type="primary"
+              ghost
+              :loading="polishing"
+              :disabled="!polishResult || !polishResult.trim()"
+              @click="handleRepolish"
+            >
+              <thunderbolt-outlined />
+              再次 AI 润色
+            </a-button>
+          </a-space>
+          <a-space>
+            <a-button @click="polishVisible = false">取消</a-button>
+            <a-button type="primary" @click="handleConfirmPolish">确认使用</a-button>
+          </a-space>
+        </div>
+      </div>
+    </a-modal>
   </div>
 </template>
 
@@ -223,6 +294,7 @@ import {
   PlusOutlined,
   CopyOutlined,
   CrownOutlined,
+  ThunderboltOutlined,
 } from '@ant-design/icons-vue'
 import { agentApi, llmConfigApi } from '@/api'
 
@@ -240,6 +312,12 @@ const llmLoading = ref(false)
 const officialVisible = ref(false)
 const officialAgents = ref([])
 const officialLoading = ref(false)
+const polishing = ref(false)
+
+// AI 润色对比弹窗状态
+const polishVisible = ref(false)
+const polishOriginal = ref('')
+const polishResult = ref('')
 
 const pagination = reactive({
   current: 1,
@@ -346,7 +424,7 @@ async function fetchList() {
 async function fetchLlmConfigs() {
   llmLoading.value = true
   try {
-    const res = await llmConfigApi.list({ page: 1, page_size: 200 })
+    const res = await llmConfigApi.list({ page: 1, page_size: 100 })
     llmConfigs.value = Array.isArray(res) ? res : res?.items || res?.list || res?.data || []
   } catch (e) {
   } finally {
@@ -447,6 +525,62 @@ async function handleCloneOfficial(item) {
   } catch (e) {}
 }
 
+async function handlePolishPrompt() {
+  if (!form.system_prompt || !form.system_prompt.trim()) return
+  // 保存原始提示词，打开对比弹窗
+  polishOriginal.value = form.system_prompt
+  polishResult.value = ''
+  polishVisible.value = true
+  polishing.value = true
+  try {
+    const res = await agentApi.polishPrompt(form.system_prompt)
+    if (res?.polished_prompt) {
+      polishResult.value = res.polished_prompt
+      if (res.fallback) {
+        message.warning('润色完成（已自动降级为模型默认参数）')
+      }
+    } else {
+      message.warning('润色结果为空，请重试')
+    }
+  } catch (e) {
+    message.error('AI 润色失败，请稍后重试')
+  } finally {
+    polishing.value = false
+  }
+}
+
+async function handleRepolish() {
+  if (!polishResult.value || !polishResult.value.trim()) return
+  polishing.value = true
+  try {
+    const res = await agentApi.polishPrompt(polishResult.value)
+    if (res?.polished_prompt) {
+      polishResult.value = res.polished_prompt
+      if (res.fallback) {
+        message.warning('润色完成（已自动降级为模型默认参数）')
+      } else {
+        message.success('AI 润色完成')
+      }
+    } else {
+      message.warning('润色结果为空，请重试')
+    }
+  } catch (e) {
+    message.error('AI 润色失败，请稍后重试')
+  } finally {
+    polishing.value = false
+  }
+}
+
+function handleConfirmPolish() {
+  if (!polishResult.value || !polishResult.value.trim()) {
+    message.warning('润色结果为空，无法应用')
+    return
+  }
+  form.system_prompt = polishResult.value
+  polishVisible.value = false
+  message.success('已应用润色后的系统提示词')
+}
+
 onMounted(() => {
   fetchList()
   fetchLlmConfigs()
@@ -493,5 +627,59 @@ onMounted(() => {
 
 .text-mono {
   font-family: 'SFMono-Regular', Consolas, monospace;
+}
+
+.prompt-wrapper {
+  position: relative;
+}
+
+.polish-btn {
+  position: absolute;
+  right: 4px;
+  bottom: -28px;
+  padding: 0 4px;
+  font-size: 12px;
+  color: #722ed1;
+}
+
+.polish-btn:hover {
+  color: #531dab;
+}
+
+.polish-compare {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.polish-panel {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+.polish-panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+
+.polish-panel-title {
+  font-weight: 600;
+  font-size: 14px;
+  color: #262626;
+}
+
+.polish-textarea-readonly {
+  background: #fafafa;
+}
+
+.polish-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding-top: 8px;
+  border-top: 1px solid #f0f0f0;
 }
 </style>
