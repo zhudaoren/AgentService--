@@ -117,7 +117,7 @@
                 :loading="disconnectingId === record.id"
                 @click="handleDisconnect(record)"
               >
-                <unlink-outlined />
+                <scissor-outlined />
                 断开
               </a-button>
               <a-button
@@ -168,7 +168,7 @@
               SSE 远程
             </a-radio-button>
             <a-radio-button value="stdio">
-              <console-outlined />
+              <code-outlined />
               STDIO 本地子进程
             </a-radio-button>
           </a-radio-group>
@@ -199,7 +199,7 @@
               placeholder="python /path/mcp_server.py"
             >
               <template #prefix>
-                <console-outlined />
+                <code-outlined />
               </template>
             </a-input>
           </a-form-item>
@@ -317,11 +317,11 @@ import {
   ReloadOutlined,
   ToolOutlined,
   LinkOutlined,
-  UnlinkOutlined,
+  ScissorOutlined,
   ThunderboltOutlined,
   DatabaseOutlined,
   GlobalOutlined,
-  ConsoleOutlined,
+  CodeOutlined,
   PlayCircleOutlined,
   FileTextOutlined,
   CheckCircleOutlined,

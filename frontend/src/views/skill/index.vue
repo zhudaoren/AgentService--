@@ -104,7 +104,7 @@
           </template>
           <template v-else-if="column.key === 'levels'">
             <span class="levels-badge">
-              <layers-outlined />
+              <appstore-outlined />
               {{ (record.levels?.length || 0) > 0 ? `${record.levels.length}级${(record.levels?.length || 0) >= 3 ? '完整' : ''}` : '-' }}
             </span>
           </template>
@@ -140,7 +140,7 @@
                 详情
               </a-button>
               <a-button type="link" size="small" @click="openProgressiveDrawer(record)">
-                <layers-outlined />
+                <appstore-outlined />
                 渐进式查看
               </a-button>
               <a-divider type="vertical" />
@@ -346,7 +346,7 @@
         <a-divider orientation="left">内容预览</a-divider>
         <div v-for="(lv, i) in (currentSkill.levels || [])" :key="i" class="level-preview">
           <div class="level-preview-title">
-            <layers-outlined />
+            <appstore-outlined />
             Level {{ lv.level ?? i }}
             <span class="level-meta">
               ({{ (lv.prompt_text || '').length }} 字符 / {{ lv.actual_tokens || 0 }} tokens / 预算 {{ lv.budget_tokens || '-' }})
@@ -425,7 +425,7 @@ import {
   SearchOutlined,
   ReloadOutlined,
   EyeOutlined,
-  LayersOutlined,
+  AppstoreOutlined,
   InfoCircleOutlined,
   InboxOutlined,
   LinkOutlined,

@@ -81,19 +81,107 @@
                 <robot-outlined />
               </a-avatar>
             </div>
-            <div class="msg-bubble">
-              <div class="msg-content markdown-body" v-html="renderMarkdown(msg.content)"></div>
-              <div class="msg-footer">
-                <span v-if="msg.created_at" class="msg-time">{{ formatTime(msg.created_at) }}</span>
-                <a-button
-                  type="text"
+            <div class="msg-content-col">
+              <!-- 工具调用卡片（tool_call） -->
+              <template
+                v-if="msg.message_type === 'tool_call' || msg.tool_calls?.length"
+              >
+                <a-card type="inner" size="small" class="tool-call-card">
+                  <template #title>
+                    <span class="tool-call-title">
+                      <tool-outlined />
+                      调用工具
+                      <a-spin v-if="msg._toolLoading" size="small" style="margin-left: 8px" />
+                    </span>
+                  </template>
+                  <div class="tool-call-list">
+                    <div
+                      v-for="(tc, i) in (msg.tool_calls || [makeToolCall(msg)])"
+                      :key="i"
+                      class="tool-call-item"
+                      :class="{ loading: msg._toolLoading && !tc.result }"
+                    >
+                      <div class="tool-call-name">
+                        <span class="tool-name-mono">{{ tc.name || tc.tool_name || 'unknown' }}</span>
+                      </div>
+                      <div class="tool-call-args">
+                        <div class="args-label">入参：</div>
+                        <SpoilerBlock
+                          :content="formatJSON(tc.arguments || tc.args || tc.input || {})"
+                          :limit="200"
+                          label-code
+                        />
+                      </div>
+                      <div v-if="tc.error" class="tool-call-result result-error">
+                        <div class="result-label">错误：</div>
+                        <SpoilerBlock :content="String(tc.error)" :limit="200" error />
+                      </div>
+                      <div v-else-if="tc.result !== undefined && tc.result !== null" class="tool-call-result">
+                        <div class="result-label">结果：</div>
+                        <SpoilerBlock :content="formatJSON(tc.result)" :limit="200" success />
+                      </div>
+                    </div>
+                  </div>
+                </a-card>
+              </template>
+
+              <!-- 工具结果卡片（tool_result） -->
+              <template v-else-if="msg.message_type === 'tool_result'">
+                <a-card
+                  type="inner"
                   size="small"
-                  class="msg-copy-btn"
-                  @click="copyMessage(msg.content)"
+                  class="tool-result-card"
+                  :class="{ 'is-error': !!msg.error }"
                 >
-                  <copy-outlined />
-                  复制
-                </a-button>
+                  <template #title>
+                    <span class="tool-result-title" :class="{ 'is-error': !!msg.error }">
+                      <template v-if="msg.error">
+                        <close-circle-outlined />
+                        工具失败
+                      </template>
+                      <template v-else>
+                        <check-circle-outlined />
+                        工具结果
+                      </template>
+                      <span class="tool-name-inline">
+                        · {{ msg.tool_name || msg.name || '' }}
+                      </span>
+                    </span>
+                  </template>
+                  <div class="tool-result-body">
+                    <SpoilerBlock
+                      :content="formatJSON(msg.result ?? msg.content ?? msg.output ?? '')"
+                      :limit="200"
+                      :error="!!msg.error"
+                      :success="!msg.error"
+                      label-code
+                    />
+                  </div>
+                </a-card>
+              </template>
+
+              <!-- 普通气泡 -->
+              <div v-else class="msg-bubble">
+                <div
+                  class="msg-content markdown-body"
+                  v-if="msg.content || msg.role === 'assistant'"
+                  v-html="renderMarkdown(msg.content || '_（无文本内容）_')"
+                ></div>
+                <div class="msg-footer">
+                  <span v-if="msg.created_at" class="msg-time">{{ formatTime(msg.created_at) }}</span>
+                  <template v-if="msg.role === 'assistant' && !msg.message_type && !msg.tool_calls">
+                    <!-- 停止生成时不显示 -->
+                    <a-button
+                      type="text"
+                      size="small"
+                      class="msg-copy-btn"
+                      @click="copyMessage(msg.content)"
+                    >
+                      <copy-outlined />
+                      复制
+                    </a-button>
+                  </template>
+                </div>
               </div>
             </div>
           </div>
@@ -104,13 +192,35 @@
                 <robot-outlined />
               </a-avatar>
             </div>
-            <div class="msg-bubble">
-              <div class="msg-typing">
-                <a-spin size="small" />
-                <span class="msg-typing-text">正在生成回复...</span>
+            <div class="msg-content-col">
+              <div class="msg-bubble">
+                <div class="msg-typing">
+                  <a-spin size="small" />
+                  <span class="msg-typing-text">正在生成回复...</span>
+                </div>
               </div>
             </div>
           </div>
+        </div>
+
+        <!-- 浮动操作条：最后一条是 assistant 时显示 -->
+        <div
+          v-if="!streaming && messages.length && lastAssistantMessage && !lastAssistantMessage.message_type"
+          class="msg-action-bar"
+        >
+          <a-tooltip title="重新生成">
+            <a-button
+              type="primary"
+              ghost
+              size="small"
+              :loading="regenerating"
+              :disabled="regenerating"
+              @click="handleRegenerate"
+            >
+              <reload-outlined />
+              重新生成
+            </a-button>
+          </a-tooltip>
         </div>
 
         <!-- 输入区域 -->
@@ -191,7 +301,7 @@
 </template>
 
 <script setup>
-import { ref, reactive, onMounted, nextTick, watch } from 'vue'
+import { ref, reactive, onMounted, nextTick, watch, computed, defineComponent, h } from 'vue'
 import { message, Empty } from 'ant-design-vue'
 import {
   PlusOutlined,
@@ -203,11 +313,66 @@ import {
   SendOutlined,
   StopOutlined,
   ClearOutlined,
+  ToolOutlined,
+  CheckCircleOutlined,
+  CloseCircleOutlined,
+  ReloadOutlined,
+  DownOutlined,
+  UpOutlined,
 } from '@ant-design/icons-vue'
 import { marked } from 'marked'
 import { conversationApi, chatApi, agentApi } from '@/api'
 
-// 配置 marked
+// 折叠显示组件（内联）
+const SpoilerBlock = defineComponent({
+  name: 'SpoilerBlock',
+  props: {
+    content: { type: [String, Object, Array, Number], default: '' },
+    limit: { type: Number, default: 200 },
+    error: Boolean,
+    success: Boolean,
+    labelCode: Boolean,
+  },
+  setup(props) {
+    const expanded = ref(false)
+    const text = computed(() => {
+      const c = props.content
+      if (c === null || c === undefined) return ''
+      if (typeof c === 'string') return c
+      try { return JSON.stringify(c, null, 2) } catch (e) { return String(c) }
+    })
+    const shouldCollapse = computed(() => String(text.value).length > props.limit)
+    const displayText = computed(() => {
+      const t = String(text.value)
+      if (shouldCollapse.value && !expanded.value) {
+        return t.slice(0, props.limit) + '...'
+      }
+      return t
+    })
+    return () => {
+      const cls = [
+        'spoiler-block',
+        props.error ? 'is-error' : '',
+        props.success ? 'is-success' : '',
+        props.labelCode ? 'is-code' : '',
+      ].filter(Boolean).join(' ')
+      return h('div', { class: cls }, [
+        h('pre', { class: 'spoiler-pre' }, displayText.value),
+        shouldCollapse.value
+          ? h(
+              'a',
+              {
+                class: 'spoiler-toggle',
+                onClick: () => { expanded.value = !expanded.value },
+              },
+              expanded.value ? [h(UpOutlined), ' 收起'] : [h(DownOutlined), ' 展开查看']
+            )
+          : null,
+      ])
+    }
+  },
+})
+
 marked.setOptions({
   breaks: true,
   gfm: true,
@@ -227,6 +392,7 @@ const msgListRef = ref(null)
 const inputText = ref('')
 const streaming = ref(false)
 const streamingText = ref('')
+const regenerating = ref(false)
 let abortController = null
 
 // ============ 新建会话 ============
@@ -239,8 +405,32 @@ const newConvForm = reactive({
   title: '',
 })
 
-// 默认用户 ID（实际项目应从登录态获取）
+// 默认用户 ID
 const DEFAULT_USER_ID = 'default_user'
+
+// 最后一条 assistant 消息
+const lastAssistantMessage = computed(() => {
+  const list = messages.value
+  for (let i = list.length - 1; i >= 0; i--) {
+    if (list[i].role === 'assistant') return list[i]
+  }
+  return null
+})
+
+function makeToolCall(msg) {
+  return {
+    name: msg.tool_name || msg.name || '',
+    arguments: msg.arguments || msg.args || msg.input || {},
+    result: msg.result,
+    error: msg.error,
+  }
+}
+
+function formatJSON(v) {
+  if (v === null || v === undefined) return ''
+  if (typeof v === 'string') return v
+  try { return JSON.stringify(v, null, 2) } catch (e) { return String(v) }
+}
 
 function renderMarkdown(text) {
   if (!text) return ''
@@ -264,12 +454,11 @@ function formatTime(t) {
 
 async function copyMessage(text) {
   try {
-    await navigator.clipboard.writeText(text)
+    await navigator.clipboard.writeText(text || '')
     message.success('已复制到剪贴板')
   } catch (e) {
-    // 兜底
     const ta = document.createElement('textarea')
-    ta.value = text
+    ta.value = text || ''
     document.body.appendChild(ta)
     ta.select()
     try {
@@ -324,11 +513,12 @@ async function loadMessages(convId) {
   try {
     const res = await conversationApi.messages(convId)
     const list = Array.isArray(res) ? res : res?.items || res?.list || res?.messages || res?.data || []
-    // 规范化字段：role / content
     messages.value = list.map((m) => ({
       ...m,
       role: m.role || (m.is_user ? 'user' : 'assistant'),
       content: m.content ?? m.text ?? '',
+      message_type: m.message_type,
+      tool_calls: m.tool_calls,
     }))
     await nextTick()
     scrollToBottom()
@@ -389,7 +579,7 @@ async function handleDeleteConv(conv) {
   } catch (e) {}
 }
 
-// ============ 发送消息（SSE 流式） ============
+// ============ 发送消息（SSE 流式 + 工具事件） ============
 function handleKeydown(e) {
   if (e.key === 'Enter' && !e.shiftKey) {
     e.preventDefault()
@@ -399,11 +589,126 @@ function handleKeydown(e) {
   }
 }
 
+// 通用：开启流式，发送到 handlers，最后把 assistant 消息推到 messages
+function startStream({ payload, isRegenerate = false }) {
+  streaming.value = true
+  streamingText.value = ''
+
+  const assistantMsg = reactive({
+    role: 'assistant',
+    content: '',
+    _temp_id: Date.now() + '_a_' + Math.random(),
+    created_at: new Date().toISOString(),
+  })
+  messages.value.push(assistantMsg)
+
+  const handlers = {
+    onMessage: (data) => {
+      // 工具调用事件
+      if (data.type === 'tool_call' || data.event === 'tool_call') {
+        appendToolCallMessage(data, assistantMsg)
+        return
+      }
+      if (data.type === 'tool_result' || data.event === 'tool_result') {
+        appendToolResultMessage(data)
+        return
+      }
+      if (data.content) {
+        assistantMsg.content += data.content
+        streamingText.value = assistantMsg.content
+        scrollToBottom()
+      }
+    },
+    onDone: (data) => {
+      streaming.value = false
+      streamingText.value = ''
+      regenerating.value = false
+      if (data?.message_id) {
+        assistantMsg.id = data.message_id
+      }
+      if (!assistantMsg.content && !assistantMsg.message_type && !assistantMsg.tool_calls) {
+        assistantMsg.content = '_(未收到回复)_'
+      }
+      if (data?.fallback) {
+        message.warning(data.fallback_message || '已自动降级为模型默认参数')
+      }
+      abortController = null
+      scrollToBottom()
+    },
+    onError: (err) => {
+      streaming.value = false
+      streamingText.value = ''
+      regenerating.value = false
+      if (!assistantMsg.content) {
+        assistantMsg.content = `⚠️ 发生错误：${err.message || '请求失败'}`
+      }
+      abortController = null
+      scrollToBottom()
+    },
+  }
+
+  abortController = isRegenerate
+    ? chatApi.regenerate(payload, handlers)
+    : chatApi.sendStream(payload, handlers)
+}
+
+function appendToolCallMessage(data, linkedAssistantMsg) {
+  const toolCalls = data.tool_calls || [{
+    name: data.name || data.tool_name,
+    tool_name: data.tool_name || data.name,
+    arguments: data.arguments || data.args || data.input || {},
+  }]
+  const msg = reactive({
+    role: 'assistant',
+    content: '',
+    message_type: 'tool_call',
+    tool_calls: toolCalls,
+    _toolLoading: true,
+    _linkedTempId: linkedAssistantMsg?._temp_id,
+    _temp_id: Date.now() + '_tc_' + Math.random(),
+    created_at: new Date().toISOString(),
+  })
+  messages.value.push(msg)
+  scrollToBottom()
+}
+
+function appendToolResultMessage(data) {
+  // 先尝试配对：如果前面 tool_call 正在 loading，更新其 loading 与 result
+  const toolName = data.tool_name || data.name
+  for (let i = messages.value.length - 1; i >= 0; i--) {
+    const m = messages.value[i]
+    if (m.message_type === 'tool_call' && m._toolLoading) {
+      const list = m.tool_calls || []
+      for (const tc of list) {
+        if (!tc.result && !tc.error && (!toolName || (tc.name || tc.tool_name) === toolName)) {
+          if (data.error) tc.error = data.error
+          else tc.result = data.result ?? data.content ?? data.output ?? ''
+          m._toolLoading = false
+          scrollToBottom()
+          return
+        }
+      }
+    }
+  }
+  const msg = reactive({
+    role: 'assistant',
+    content: '',
+    message_type: 'tool_result',
+    tool_name: data.tool_name || data.name,
+    name: data.tool_name || data.name,
+    result: data.result ?? data.content ?? data.output ?? '',
+    error: data.error,
+    _temp_id: Date.now() + '_tr_' + Math.random(),
+    created_at: new Date().toISOString(),
+  })
+  messages.value.push(msg)
+  scrollToBottom()
+}
+
 async function handleSend() {
   const content = inputText.value.trim()
   if (!content || streaming.value) return
 
-  // 推入用户消息
   const userMsg = {
     role: 'user',
     content,
@@ -415,73 +720,56 @@ async function handleSend() {
   await nextTick()
   scrollToBottom()
 
-  // 创建一个占位的 assistant 消息
-  const assistantMsg = reactive({
-    role: 'assistant',
-    content: '',
-    _temp_id: Date.now() + '_a',
-    created_at: new Date().toISOString(),
+  startStream({
+    payload: {
+      conversation_id: currentConvId.value,
+      content,
+    },
   })
-  messages.value.push(assistantMsg)
+}
 
-  streaming.value = true
-  streamingText.value = ''
+async function handleRegenerate() {
+  if (streaming.value || regenerating.value) return
+  // 回退：删除最后一条 user + assistant 消息对的 assistant
+  // 简化实现：如果最后一条是 assistant，直接触发 regenerate
+  let lastUserIndex = -1
+  for (let i = messages.value.length - 1; i >= 0; i--) {
+    if (messages.value[i].role === 'user') { lastUserIndex = i; break }
+  }
+  // 移除最后一条 assistant 消息（及其附带的 tool_call/tool_result）
+  if (lastUserIndex >= 0) {
+    // 找到从 lastUserIndex+1 到末尾的 assistant 消息，截断
+    messages.value = messages.value.slice(0, lastUserIndex + 1)
+  }
 
-  abortController = chatApi.sendStream(
-    { conversation_id: currentConvId.value, content },
-    {
-      onMessage: (data) => {
-        if (data.content) {
-          assistantMsg.content += data.content
-          streamingText.value = assistantMsg.content
-          scrollToBottom()
-        }
-      },
-      onDone: (data) => {
-        streaming.value = false
-        streamingText.value = ''
-        if (data?.message_id) {
-          assistantMsg.id = data.message_id
-        }
-        // 若没有收到任何内容，给出提示
-        if (!assistantMsg.content) {
-          assistantMsg.content = '_(未收到回复)_'
-        }
-        // 若后端降级使用了默认参数，给出提示
-        if (data?.fallback) {
-          message.warning(data.fallback_message || '已自动降级为模型默认参数')
-        }
-        abortController = null
-      },
-      onError: (err) => {
-        streaming.value = false
-        streamingText.value = ''
-        if (!assistantMsg.content) {
-          assistantMsg.content = `⚠️ 发生错误：${err.message || '请求失败'}`
-        }
-        abortController = null
-      },
-    }
-  )
+  regenerating.value = true
+  const userMsg = messages.value[lastUserIndex] || {}
+  startStream({
+    payload: {
+      conversation_id: currentConvId.value,
+      content: userMsg.content || '',
+    },
+    isRegenerate: true,
+  })
 }
 
 async function handleStop() {
-  // 优先调用后端停止接口
-  try {
-    await chatApi.stop(currentConvId.value)
-  } catch (e) {}
-  // 本地中断流
+  try { await chatApi.stop(currentConvId.value) } catch (e) {}
   if (abortController) {
     abortController.abort()
     abortController = null
   }
   streaming.value = false
   streamingText.value = ''
+  regenerating.value = false
+  // 把 tool_call 的 loading 关掉
+  for (const m of messages.value) {
+    if (m.message_type === 'tool_call') m._toolLoading = false
+  }
   message.info('已停止生成')
 }
 
 watch(currentConvId, () => {
-  // 切换会话时取消流式
   if (streaming.value && abortController) {
     abortController.abort()
     abortController = null
@@ -605,6 +893,7 @@ onMounted(() => {
   flex-direction: column;
   min-width: 0;
   background: #fff;
+  position: relative;
 }
 
 .chat-header {
@@ -623,7 +912,7 @@ onMounted(() => {
 .msg-list {
   flex: 1;
   overflow: auto;
-  padding: 20px;
+  padding: 20px 20px 60px;
   background: #f7f8fa;
 }
 
@@ -651,12 +940,22 @@ onMounted(() => {
   flex-shrink: 0;
 }
 
-.msg-bubble {
+.msg-content-col {
   max-width: 75%;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.msg-row.user .msg-content-col { align-items: flex-end; }
+
+.msg-bubble {
   padding: 12px 16px;
   border-radius: 8px;
   background: #fff;
   box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
+  width: 100%;
 }
 
 .msg-row.user .msg-bubble {
@@ -691,6 +990,154 @@ onMounted(() => {
   color: #8c8c8c;
   font-size: 13px;
 }
+
+/* 重新生成浮动条 */
+.msg-action-bar {
+  position: absolute;
+  left: 50%;
+  transform: translateX(-50%);
+  bottom: 120px;
+  background: rgba(255, 255, 255, 0.95);
+  backdrop-filter: blur(4px);
+  padding: 6px 12px;
+  border-radius: 20px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.08);
+  z-index: 10;
+}
+
+/* 工具卡片 */
+.tool-call-card,
+.tool-result-card {
+  margin: 0;
+  width: 100%;
+  border-radius: 8px;
+  border: 1px solid #e0e7ff;
+  background: #fff;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
+}
+
+.tool-call-card :deep(.ant-card-head) {
+  background: linear-gradient(180deg, #f0f5ff 0%, #ffffff 100%);
+  border-bottom: 1px dashed #c7d2fe;
+}
+
+.tool-result-card :deep(.ant-card-head) {
+  background: linear-gradient(180deg, #f6ffed 0%, #ffffff 100%);
+  border-bottom: 1px dashed #b7eb8f;
+}
+
+.tool-result-card.is-error :deep(.ant-card-head) {
+  background: linear-gradient(180deg, #fff2f0 0%, #ffffff 100%);
+  border-bottom: 1px dashed #ffccc7;
+}
+
+.tool-call-title,
+.tool-result-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: 600;
+  font-size: 13px;
+  color: #4338ca;
+}
+
+.tool-result-title { color: #389e0d; }
+.tool-result-title.is-error { color: #cf1322; }
+
+.tool-name-inline {
+  font-family: 'SFMono-Regular', Consolas, monospace;
+  font-size: 12px;
+  color: #595959;
+  font-weight: 400;
+}
+
+.tool-call-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.tool-call-item {
+  padding: 8px 10px;
+  background: #fafbff;
+  border: 1px solid #eef0fc;
+  border-radius: 6px;
+}
+
+.tool-call-item.loading {
+  background: #fffbf0;
+  border-color: #ffe58f;
+}
+
+.tool-call-name {
+  margin-bottom: 6px;
+}
+
+.tool-name-mono {
+  font-family: 'SFMono-Regular', Consolas, monospace;
+  font-size: 12px;
+  font-weight: 600;
+  color: #1677ff;
+  background: #e6f4ff;
+  padding: 2px 8px;
+  border-radius: 4px;
+  display: inline-block;
+}
+
+.tool-call-args,
+.tool-call-result {
+  margin-bottom: 4px;
+}
+
+.args-label,
+.result-label {
+  font-size: 11px;
+  color: #8c8c8c;
+  margin-bottom: 2px;
+}
+
+.tool-call-result.result-error .result-label { color: #cf1322; }
+
+.tool-result-body {
+  width: 100%;
+}
+
+/* Spoiler 折叠块（使用 :deep 渲染内联子组件 class） */
+:deep(.spoiler-block) {
+  border-radius: 4px;
+  padding: 6px 8px;
+}
+:deep(.spoiler-block.is-code) {
+  background: #f6f8fa;
+  border: 1px solid #eaecef;
+}
+:deep(.spoiler-block.is-success) {
+  background: #f6ffed;
+  border: 1px solid #b7eb8f;
+}
+:deep(.spoiler-block.is-error) {
+  background: #fff2f0;
+  border: 1px solid #ffccc7;
+}
+:deep(.spoiler-pre) {
+  margin: 0;
+  font-family: 'SFMono-Regular', Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: #262626;
+}
+:deep(.spoiler-toggle) {
+  display: inline-flex;
+  align-items: center;
+  margin-top: 4px;
+  font-size: 12px;
+  color: #1677ff;
+  cursor: pointer;
+  gap: 2px;
+}
+:deep(.spoiler-toggle:hover) { color: #0958d9; text-decoration: underline; }
 
 /* 输入区 */
 .chat-input-area {
