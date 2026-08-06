@@ -19,6 +19,41 @@
 | MinIO | ≥ 2024-01 | Skill本地文件存储 | P2必需 |
 | Milvus | ≥ 2.4 | 长期记忆向量化 | P2必需 |
 
+### 中间件 Docker 镜像清单
+
+P2阶段需要拉取以下镜像：
+
+| 镜像 | 容器名 | 端口 | 用途 |
+|------|--------|------|------|
+| `mysql:8.0` | agent-mysql | 3306 | 数据库（20张表） |
+| `redis:7-alpine` | agent-redis | 6379 | 短期记忆缓存 |
+| `minio/minio:RELEASE.2024-01-01T00-00-00Z` | agent-minio | 9000, 9001 | Skill文件存储 |
+| `quay.io/coreos/etcd:v3.5.5` | agent-milvus-etcd | - | Milvus元数据存储 |
+| `minio/minio:RELEASE.2023-03-20T20-16-18Z` | agent-milvus-minio | - | Milvus内部对象存储 |
+| `milvusdb/milvus:v2.4.0` | agent-milvus | 19530, 9091 | 长期记忆向量检索 |
+
+提前拉取镜像（可选，启动脚本也会自动拉取）：
+
+```bash
+docker pull mysql:8.0
+docker pull redis:7-alpine
+docker pull minio/minio:RELEASE.2024-01-01T00-00-00Z
+docker pull quay.io/coreos/etcd:v3.5.5
+docker pull minio/minio:RELEASE.2023-03-20T20-16-18Z
+docker pull milvusdb/milvus:v2.4.0
+```
+
+> 国内用户如拉取缓慢，可配置 Docker 镜像加速：
+> ```json
+> // /etc/docker/daemon.json
+> {
+>   "registry-mirrors": [
+>     "https://docker.mirrors.ustc.edu.cn",
+>     "https://hub-mirror.c.163.com"
+>   ]
+> }
+> ```
+
 ### 方式一：Docker Compose 一键启动（推荐）
 
 ```bash
@@ -51,7 +86,27 @@ pip install fastapi uvicorn[standard] pydantic pydantic-settings \
   aiohttp minio pymilvus python-multipart
 ```
 
-#### 2. 启动中间件
+#### 2. 启动中间件（一键脚本，推荐）
+
+```bash
+# Linux / macOS
+./scripts/start-middleware.sh
+
+# 或使用 Python 跨平台脚本
+python scripts/start-middleware.py
+
+# 首次启动先拉取镜像
+./scripts/start-middleware.sh --pull
+# 或
+python scripts/start-middleware.py --pull
+
+# 仅检查环境（Docker是否安装、端口是否占用）
+./scripts/start-middleware.sh --check-only
+```
+
+启动后脚本会自动等待所有中间件就绪（MySQL / Redis / MinIO / Milvus 健康检查通过）。
+
+**手动启动（如需单独调试）**
 
 ```bash
 # MySQL
@@ -100,7 +155,22 @@ docker run -d --name agent-milvus \
 mysql -u root -proot123 agent_service < infra/mysql/init.sql
 ```
 
-#### 3. 配置环境变量
+#### 3. 停止中间件
+
+```bash
+# Linux / macOS
+./scripts/stop-middleware.sh
+
+# 或使用 Python 跨平台脚本
+python scripts/stop-middleware.py
+
+# 彻底删除中间件及数据卷（慎用：会清除所有持久化数据）
+./scripts/stop-middleware.sh --volumes
+# 或
+python scripts/stop-middleware.py --volumes
+```
+
+#### 4. 配置环境变量
 
 ```bash
 cp .env.example .env
@@ -139,7 +209,7 @@ ENCRYPTION_KEY=your-32-char-secret-key-here
 OPENAI_API_KEY=sk-xxx
 ```
 
-#### 4. 启动后端服务
+#### 5. 启动后端服务
 
 **推荐：使用一键启动脚本**
 
@@ -177,7 +247,7 @@ cd services/mem-svc   && PYTHONPATH=../shared:. python -m uvicorn main:app --por
 
 > P2阶段需要启动以上5个服务（包含tool-svc）。rag-svc / chatbi-svc / coord-svc / evo-svc 仍为骨架。
 
-#### 5. 停止后端服务
+#### 6. 停止后端服务
 
 ```bash
 # 停止一键启动的后台服务
@@ -192,7 +262,7 @@ python scripts/stop-backend.py
 python scripts/stop-backend.py --force
 ```
 
-#### 6. 启动前端
+#### 7. 启动前端
 
 ```bash
 cd frontend
@@ -201,7 +271,7 @@ npm run dev
 # 打开 http://localhost:5173
 ```
 
-#### 7. 开始使用
+#### 8. 开始使用
 
 1. 打开 `http://localhost:5173` → 进入**LLM配置**页面，添加你的LLM配置（如OpenAI API Key）
 2. 进入**MCP服务管理**页面，创建MCP服务（SSE/STDIO双模式），连接后自动发现工具
@@ -443,6 +513,16 @@ agent-service-platform/
 ├── docker-compose.yml              # Docker一键部署
 ├── .env.example                    # 环境变量模板
 ├── .gitignore
+│
+├── scripts/                        # 启动/停止脚本
+│   ├── start-middleware.sh         # 中间件一键启动 (Linux/macOS)
+│   ├── stop-middleware.sh          # 中间件一键停止 (Linux/macOS)
+│   ├── start-middleware.py         # 中间件一键启动 (跨平台)
+│   ├── stop-middleware.py          # 中间件一键停止 (跨平台)
+│   ├── start-backend.sh            # 后端服务一键启动 (Linux/macOS)
+│   ├── stop-backend.sh             # 后端服务一键停止 (Linux/macOS)
+│   ├── start-backend.py            # 后端服务一键启动 (跨平台)
+│   └── stop-backend.py             # 后端服务一键停止 (跨平台)
 │
 ├── frontend/                       # Vue3 前端
 │   ├── package.json                # 依赖（vue/antd/axios/marked）
