@@ -1,19 +1,39 @@
 """MCP (Model Context Protocol) 适配器
 
-支持两种接入模式：
-  - SSE (Server-Sent Events)：HTTP + SSE 流式协议
+基于 mcp SDK 的 ClientSession 实现，支持三种接入模式：
+  - SSE (Server-Sent Events)：HTTP + SSE 流式协议 (Legacy)
+  - Streamable HTTP：HTTP 流式协议 (推荐)
   - STDIO：子进程标准输入输出 + JSON-RPC 2.0
 """
-import asyncio
-import json
-import time
+from __future__ import annotations
+
+import os
+import shlex
 from abc import ABC, abstractmethod
+from contextlib import AsyncExitStack
 from typing import Any, Optional
+
+from mcp.client.session import ClientSession
+from mcp.client.sse import sse_client
+from mcp.client.streamable_http import streamable_http_client
+from mcp.client.stdio import stdio_client, StdioServerParameters
 
 from common.logger import get_logger
 from common.exceptions import AppException
 
 logger = get_logger(__name__)
+
+
+def _extract_error(e: Exception) -> str:
+    """从 ExceptionGroup / TaskGroup 中提取真实异常信息"""
+    if hasattr(e, "exceptions"):
+        sub_msgs = [_extract_error(sub) for sub in e.exceptions]
+        return "; ".join(sub_msgs) if sub_msgs else str(e) or type(e).__name__
+    msg = str(e)
+    if msg:
+        return msg
+    # str(e) 为空时，使用异常类型和 repr 作为备选
+    return f"{type(e).__name__}: {repr(e)}"
 
 
 class MCPException(AppException):
@@ -72,400 +92,301 @@ class IMCPAdapter(ABC):
         ...
 
 
-class SSEAdapter(IMCPAdapter):
-    """SSE 模式适配器 - 通过 HTTP + SSE 与 MCP 服务通信"""
+class MCPSDKAdapter(IMCPAdapter):
+    """基于 mcp SDK ClientSession 的适配器基类
 
-    def __init__(self, url: str, timeout: int = 30):
-        self._url = url.rstrip("/") if url else ""
+    使用 AsyncExitStack 管理 transport 与 ClientSession 的异步上下文生命周期。
+    子类只需实现 ``_create_transport`` 与 ``_log_target``。
+
+    Mcp-Session-Id 会话管理:
+      - Streamable HTTP 模式下, 连接成功后通过 ``get_session_id`` 回调获取会话 ID
+      - 会话 ID 由服务器在 initialize 握手时通过响应头返回
+      - 后续请求由 SDK 自动携带 Mcp-Session-Id 头
+      - 通过 ``session_id`` 属性可获取当前会话 ID (用于监控/日志)
+      - ``is_session_invalidated()`` 检测会话是否因服务器端失效需要重建
+    """
+
+    def __init__(self, timeout: int = 30):
         self._timeout = timeout
         self._connected = False
-        self._session = None
-        self._aiohttp_mod = None
-        self._list_tools_url = f"{self._url}/list_tools"
-        self._call_tool_url = f"{self._url}/call_tool"
+        self._stack: Optional[AsyncExitStack] = None
+        self._session: Optional[ClientSession] = None
+        # Mcp-Session-Id 会话管理
+        self._get_session_id: Optional[Any] = None  # streamable_http 返回的回调
+        self._session_invalidated: bool = False  # 标记会话是否已失效
 
     @property
     def is_connected(self) -> bool:
-        return self._connected
+        return self._connected and self._session is not None
 
-    def _get_session(self):
-        """延迟创建 aiohttp ClientSession，避免导入时即实例化"""
-        if self._session is None:
+    @property
+    def session_id(self) -> Optional[str]:
+        """获取当前 Mcp-Session-Id (仅 Streamable HTTP 模式有效)"""
+        if self._get_session_id is not None:
             try:
-                import aiohttp
-                from aiohttp import ClientSession, TCPConnector
-                self._aiohttp_mod = aiohttp
-                connector = TCPConnector(limit=50, limit_per_host=20)
-                self._session = ClientSession(
-                    connector=connector,
-                    timeout=aiohttp.ClientTimeout(total=self._timeout),
-                )
-            except ImportError:
-                raise MCPConnectException("aiohttp 未安装，无法使用SSE模式")
-        return self._session
+                return self._get_session_id()
+            except Exception:
+                return None
+        return None
+
+    @property
+    def is_session_invalidated(self) -> bool:
+        """会话是否已失效, 需要重建连接"""
+        return self._session_invalidated
+
+    def mark_session_invalidated(self) -> None:
+        """标记当前会话已失效 (由上层在检测到 404/Session Not Found 时调用)"""
+        self._session_invalidated = True
+
+    @abstractmethod
+    def _create_transport(self):
+        """创建并返回 transport 异步上下文管理器
+
+        由子类实现，返回 sse_client / streamable_http_client / stdio_client 的调用结果。
+        该上下文 yield ``(read_stream, write_stream[, ...])``。
+        """
+        ...
+
+    @abstractmethod
+    def _log_target(self) -> str:
+        """返回用于日志标识的连接目标描述"""
+        ...
 
     async def connect(self) -> None:
-        """SSE模式通过调用 list_tools 探测联通性"""
-        if not self._url:
-            raise MCPConnectException("SSE模式缺少url参数")
-        try:
-            self._connected = True
-            logger.info(f"SSE MCP 连接成功: url={self._url}")
-        except Exception as e:
+        if self._connected and not self._session_invalidated:
+            return
+        # 会话失效时先清理旧连接再重建
+        if self._session_invalidated:
+            logger.info(f"MCP 会话已失效, 重建连接: {self._log_target()}")
+            await self._close_stack()
             self._connected = False
-            logger.error(f"SSE MCP 连接失败: url={self._url}, err={e}")
-            raise MCPConnectException(f"SSE连接失败: {str(e)}")
-
-    async def disconnect(self) -> None:
-        self._connected = False
-        if self._session is not None:
-            try:
-                await self._session.close()
-            except Exception as e:
-                logger.warning(f"关闭SSE session异常: {e}")
-            self._session = None
-        logger.info(f"SSE MCP 已断开: url={self._url}")
-
-    async def list_tools(self) -> list[dict]:
-        if not self._connected:
-            raise MCPException("SSE MCP未连接，请先connect")
-        session = self._get_session()
-        try:
-            async with session.get(self._list_tools_url, timeout=self._timeout) as resp:
-                resp.raise_for_status()
-                content_type = resp.headers.get("Content-Type", "")
-                if "text/event-stream" in content_type:
-                    return await self._parse_sse_events(resp)
-                else:
-                    data = await resp.json(content_type=None)
-                    if isinstance(data, dict) and "tools" in data:
-                        return data["tools"]
-                    if isinstance(data, list):
-                        return data
-                    return []
-        except MCPException:
-            raise
-        except Exception as e:
-            logger.error(f"SSE list_tools 调用失败: {e}")
-            raise MCPException(f"获取工具列表失败: {str(e)}")
-
-    async def call_tool(self, tool_name: str, arguments: dict, timeout: int = 30) -> Any:
-        if not self._connected:
-            raise MCPException("SSE MCP未连接，请先connect")
-        session = self._get_session()
-        payload = {"name": tool_name, "arguments": arguments or {}}
-        try:
-            client_timeout = self._aiohttp_mod.ClientTimeout(total=timeout) if self._aiohttp_mod else None
-            async with session.post(
-                self._call_tool_url,
-                json=payload,
-                timeout=client_timeout,
-            ) as resp:
-                resp.raise_for_status()
-                content_type = resp.headers.get("Content-Type", "")
-                if "text/event-stream" in content_type:
-                    events = await self._parse_sse_events(resp)
-                    if events and isinstance(events, list) and len(events) > 0:
-                        last = events[-1]
-                        if isinstance(last, dict):
-                            return last.get("result") or last.get("content") or last
-                        return last
-                    return None
-                else:
-                    data = await resp.json(content_type=None)
-                    if isinstance(data, dict):
-                        if "error" in data and data["error"]:
-                            raise MCPException(f"工具调用错误: {data['error']}")
-                        if "result" in data:
-                            return data["result"]
-                        if "content" in data:
-                            return data["content"]
-                    return data
-        except MCPException:
-            raise
-        except Exception as e:
-            logger.error(f"SSE call_tool 失败 tool={tool_name}: {e}")
-            raise MCPException(f"调用工具 {tool_name} 失败: {str(e)}")
-
-    async def _parse_sse_events(self, resp) -> list:
-        """解析 SSE 事件流，返回事件内容列表"""
-        events = []
-        buffer = ""
-        current_event = {}
-        async for chunk in resp.content.iter_any():
-            if isinstance(chunk, bytes):
-                try:
-                    chunk = chunk.decode("utf-8")
-                except UnicodeDecodeError:
-                    chunk = chunk.decode("utf-8", errors="replace")
-            buffer += chunk
-            while "\n\n" in buffer:
-                block, buffer = buffer.split("\n\n", 1)
-                for line in block.split("\n"):
-                    if not line:
-                        continue
-                    if line.startswith(":"):
-                        continue
-                    if ":" in line:
-                        key, _, value = line.partition(":")
-                        value = value.lstrip()
-                    else:
-                        key, value = line, ""
-                    if key == "event":
-                        current_event["event"] = value
-                    elif key == "data":
-                        if "data" in current_event:
-                            current_event["data"] += "\n" + value
-                        else:
-                            current_event["data"] = value
-                    elif key == "id":
-                        current_event["id"] = value
-                if "data" in current_event:
-                    data_str = current_event["data"]
-                    try:
-                        parsed = json.loads(data_str)
-                        events.append(parsed)
-                    except json.JSONDecodeError:
-                        events.append(data_str)
-                current_event = {}
-        if buffer.strip():
-            pass
-        return events
-
-
-class STDIOAdapter(IMCPAdapter):
-    """STDIO 模式适配器 - 通过子进程 stdin/stdout 执行 JSON-RPC 2.0"""
-
-    def __init__(self, command: str, args: Optional[list] = None, env: Optional[dict] = None, timeout: int = 30):
-        self._command = command
-        self._args = args or []
-        self._env = env or None
-        self._timeout = timeout
-        self._process: Optional[asyncio.subprocess.Process] = None
-        self._connected = False
-        self._request_id = 0
-        self._write_lock = asyncio.Lock()
-
-    @property
-    def is_connected(self) -> bool:
-        return self._connected and self._process is not None and self._process.returncode is None
-
-    def _next_id(self) -> int:
-        self._request_id += 1
-        return self._request_id
-
-    async def connect(self) -> None:
+            self._session_invalidated = False
+            self._get_session_id = None
         if self._connected:
             return
-        if not self._command:
-            raise MCPConnectException("STDIO模式缺少command参数")
         try:
-            import os
-            exec_env = None
-            if self._env:
-                exec_env = os.environ.copy()
-                exec_env.update(self._env)
-            self._process = await asyncio.create_subprocess_exec(
-                self._command,
-                *self._args,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=exec_env,
+            self._stack = AsyncExitStack()
+            transport = self._create_transport()
+            transport_result = await self._stack.enter_async_context(transport)
+            # sse/stdio yield (read, write); streamable_http yield (read, write, get_session_id)
+            read_stream, write_stream = transport_result[0], transport_result[1]
+            # Streamable HTTP 模式: 提取 get_session_id 回调用于 Mcp-Session-Id 管理
+            if len(transport_result) >= 3:
+                self._get_session_id = transport_result[2]
+            self._session = await self._stack.enter_async_context(
+                ClientSession(read_stream, write_stream)
             )
+            await self._session.initialize()
             self._connected = True
-            self._request_id = 0
-            logger.info(
-                f"STDIO MCP 启动成功: command={self._command}, "
-                f"args={self._args}, pid={self._process.pid}"
-            )
-        except Exception as e:
+            sid = self.session_id
+            if sid:
+                logger.info(f"MCP 连接成功: {self._log_target()}, session_id={sid}")
+            else:
+                logger.info(f"MCP 连接成功: {self._log_target()}")
+        except MCPConnectException:
+            await self._close_stack()
             self._connected = False
-            self._process = None
-            logger.error(f"STDIO MCP 启动失败: command={self._command}, err={e}")
-            raise MCPConnectException(f"STDIO进程启动失败: {str(e)}")
+            self._get_session_id = None
+            raise
+        except Exception as e:
+            await self._close_stack()
+            self._connected = False
+            self._get_session_id = None
+            error_msg = _extract_error(e)
+            logger.error(f"MCP 连接失败: {self._log_target()}, err={error_msg}")
+            raise MCPConnectException(f"MCP连接失败: {error_msg}")
+
+    async def _close_stack(self) -> None:
+        if self._stack is not None:
+            try:
+                await self._stack.aclose()
+            except Exception as e:
+                logger.warning(f"关闭MCP上下文栈异常(忽略): {e}")
+            self._stack = None
+        self._session = None
+        self._get_session_id = None
 
     async def disconnect(self) -> None:
+        await self._close_stack()
         self._connected = False
-        if self._process is not None:
-            try:
-                if self._process.stdin:
-                    try:
-                        self._process.stdin.close()
-                    except Exception:
-                        pass
-                if self._process.returncode is None:
-                    self._process.terminate()
-                    try:
-                        await asyncio.wait_for(self._process.wait(), timeout=5)
-                    except asyncio.TimeoutError:
-                        self._process.kill()
-                        try:
-                            await self._process.wait()
-                        except Exception:
-                            pass
-                stderr_output = b""
-                if self._process.stderr:
-                    try:
-                        stderr_output, _ = await self._process.communicate()
-                    except Exception:
-                        pass
-                if stderr_output:
-                    try:
-                        stderr_text = stderr_output.decode("utf-8", errors="replace").strip()
-                        if stderr_text:
-                            logger.warning(f"STDIO MCP stderr: {stderr_text}")
-                    except Exception:
-                        pass
-            except Exception as e:
-                logger.warning(f"关闭STDIO进程异常: {e}")
-            finally:
-                self._process = None
-        logger.info(f"STDIO MCP 已断开: command={self._command}")
+        self._session_invalidated = False
+        logger.info(f"MCP 已断开: {self._log_target()}")
 
-    async def _send_jsonrpc(self, method: str, params: Optional[dict] = None, timeout: int = 30) -> Any:
-        """发送 JSON-RPC 2.0 请求并等待响应"""
-        if not self.is_connected:
-            raise MCPException("STDIO MCP未连接，请先connect")
-        request_id = self._next_id()
-        request_obj = {
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "method": method,
-        }
-        if params is not None:
-            request_obj["params"] = params
-        request_line = json.dumps(request_obj, ensure_ascii=False) + "\n"
-        request_bytes = request_line.encode("utf-8")
-        async with self._write_lock:
-            try:
-                self._process.stdin.write(request_bytes)
-                await self._process.stdin.drain()
-            except (BrokenPipeError, ConnectionResetError) as e:
-                self._connected = False
-                logger.error(f"STDIO写入失败 (进程可能已退出): {e}")
-                raise MCPException(f"STDIO进程通信失败: {str(e)}")
-            except Exception as e:
-                logger.error(f"STDIO写入异常: {e}")
-                raise MCPException(f"STDIO写入失败: {str(e)}")
-        start_time = time.time()
-        stdout_buffer = b""
-        stderr_tail = b""
-        while True:
-            elapsed = time.time() - start_time
-            if elapsed >= timeout:
-                raise MCPException(f"JSON-RPC调用超时 ({timeout}s): method={method}")
-            remaining = timeout - elapsed
-            try:
-                done, pending = await asyncio.wait(
-                    [self._read_stdout_line(), self._read_stderr_some()],
-                    timeout=min(remaining, 0.1),
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
-                for task in done:
-                    res = task.result()
-                    if res is None:
-                        continue
-                    tag, data = res
-                    if tag == "stdout" and data:
-                        stdout_buffer += data
-                        while b"\n" in stdout_buffer:
-                            line_bytes, stdout_buffer = stdout_buffer.split(b"\n", 1)
-                            if not line_bytes.strip():
-                                continue
-                            try:
-                                line_text = line_bytes.decode("utf-8", errors="replace")
-                                resp_obj = json.loads(line_text)
-                            except Exception:
-                                continue
-                            if isinstance(resp_obj, dict) and resp_obj.get("id") == request_id:
-                                if "error" in resp_obj and resp_obj["error"]:
-                                    err = resp_obj["error"]
-                                    msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
-                                    raise MCPException(f"JSON-RPC错误: {msg}")
-                                return resp_obj.get("result")
-                    elif tag == "stderr" and data:
-                        stderr_tail = (stderr_tail + data)[-4096:]
-                if pending:
-                    for task in pending:
-                        task.cancel()
-            except MCPException:
-                raise
-            except Exception as e:
-                logger.warning(f"等待STDIO响应异常: {e}")
-            if self._process.returncode is not None:
-                stderr_msg = ""
-                if stderr_tail:
-                    try:
-                        stderr_msg = stderr_tail.decode("utf-8", errors="replace").strip()
-                    except Exception:
-                        stderr_msg = str(stderr_tail)
-                self._connected = False
-                raise MCPException(
-                    f"STDIO进程已退出 (code={self._process.returncode}). "
-                    f"stderr: {stderr_msg}"
-                )
+    @staticmethod
+    def _is_session_error(e: Exception) -> bool:
+        """检测异常是否表示 Mcp-Session-Id 会话已失效 (需重建)
 
-    async def _read_stdout_line(self):
-        try:
-            data = await self._process.stdout.read(4096)
-            return ("stdout", data) if data else None
-        except Exception:
-            return None
-
-    async def _read_stderr_some(self):
-        try:
-            if self._process.stderr.at_eof():
-                return None
-            data = await self._process.stderr.read(4096)
-            if data:
-                try:
-                    text = data.decode("utf-8", errors="replace").strip()
-                    if text:
-                        logger.debug(f"STDIO stderr: {text[:500]}")
-                except Exception:
-                    pass
-            return ("stderr", data) if data else None
-        except Exception:
-            return None
+        常见场景:
+          - HTTP 404 Session Not Found
+          - HTTP 400 with "session" in message
+          - 服务器主动终止会话
+        """
+        err_msg = str(e).lower()
+        keywords = (
+            "session not found",
+            "session expired",
+            "session invalid",
+            "invalid session",
+            "session id",
+            "mcp-session-id",
+        )
+        if any(kw in err_msg for kw in keywords):
+            return True
+        # 404 通常表示 session 不存在
+        if "404" in err_msg and "session" in err_msg:
+            return True
+        # ExceptionGroup 中递归检测
+        if hasattr(e, "exceptions"):
+            return any(MCPSDKAdapter._is_session_error(sub) for sub in e.exceptions)
+        return False
 
     async def list_tools(self) -> list[dict]:
+        if not self.is_connected:
+            raise MCPException("MCP未连接，请先connect")
         try:
-            result = await self._send_jsonrpc("tools/list", timeout=self._timeout)
-            if result is None:
-                return []
-            if isinstance(result, list):
-                return result
-            if isinstance(result, dict):
-                if "tools" in result and isinstance(result["tools"], list):
-                    return result["tools"]
-                return [result]
-            return []
+            result = await self._session.list_tools()
+            tools: list[dict] = []
+            for tool in result.tools:
+                tool_dict = tool.model_dump() if hasattr(tool, "model_dump") else dict(tool)
+                # mcp SDK Tool 字段为 inputSchema (camelCase)，统一转为 input_schema
+                if "inputSchema" in tool_dict:
+                    tool_dict["input_schema"] = tool_dict.pop("inputSchema")
+                tools.append(tool_dict)
+            return tools
         except MCPException:
             raise
         except Exception as e:
-            logger.error(f"STDIO list_tools 调用失败: {e}")
-            raise MCPException(f"获取工具列表失败: {str(e)}")
+            # 检测 Mcp-Session-Id 会话失效
+            if self._is_session_error(e):
+                self._session_invalidated = True
+                logger.warning(f"MCP 会话已失效 (list_tools): {self._log_target()}")
+            error_msg = _extract_error(e)
+            logger.error(f"MCP list_tools 调用失败: {self._log_target()}, err={error_msg}")
+            raise MCPException(f"获取工具列表失败: {error_msg}")
 
     async def call_tool(self, tool_name: str, arguments: dict, timeout: int = 30) -> Any:
-        params = {"name": tool_name, "arguments": arguments or {}}
+        if not self.is_connected:
+            raise MCPException("MCP未连接，请先connect")
         try:
-            result = await self._send_jsonrpc("tools/call", params=params, timeout=timeout)
-            return result
+            result = await self._session.call_tool(tool_name, arguments or {})
+            return result.model_dump()
         except MCPException:
             raise
         except Exception as e:
-            logger.error(f"STDIO call_tool 失败 tool={tool_name}: {e}")
-            raise MCPException(f"调用工具 {tool_name} 失败: {str(e)}")
+            # 检测 Mcp-Session-Id 会话失效
+            if self._is_session_error(e):
+                self._session_invalidated = True
+                logger.warning(
+                    f"MCP 会话已失效 (call_tool={tool_name}): {self._log_target()}"
+                )
+            error_msg = _extract_error(e)
+            logger.error(
+                f"MCP call_tool 失败 tool={tool_name}: {self._log_target()}, err={error_msg}, "
+                f"exc_type={type(e).__name__}",
+                exc_info=True,
+            )
+            raise MCPException(f"调用工具 {tool_name} 失败: {error_msg}")
+
+
+class SSEAdapter(MCPSDKAdapter):
+    """SSE 模式适配器 (Legacy) - 通过 HTTP + SSE 与 MCP 服务通信"""
+
+    def __init__(self, url: str, headers: Optional[dict] = None, timeout: int = 30):
+        super().__init__(timeout=timeout)
+        self._url = url.rstrip("/") if url else ""
+        self._headers = headers or {}
+
+    def _create_transport(self):
+        if not self._url:
+            raise MCPConnectException("SSE模式缺少url参数")
+        return sse_client(self._url, headers=self._headers, timeout=30.0, sse_read_timeout=300.0)
+
+    def _log_target(self) -> str:
+        return f"url={self._url}"
+
+
+class StreamableHTTPAdapter(MCPSDKAdapter):
+    """Streamable HTTP 模式适配器 (推荐) - 通过 HTTP 流式协议与 MCP 服务通信"""
+
+    def __init__(self, url: str, headers: Optional[dict] = None, timeout: int = 30):
+        super().__init__(timeout=timeout)
+        self._url = url.rstrip("/") if url else ""
+        self._headers = headers or {}
+        self._http_client = None  # 自定义 httpx client（用于传递 headers/auth）
+
+    def _create_transport(self):
+        if not self._url:
+            raise MCPConnectException("Streamable HTTP模式缺少url参数")
+        # streamable_http_client 不直接支持 headers 参数，
+        # 需通过 http_client 参数传入预配置的 httpx.AsyncClient
+        if self._headers:
+            import httpx
+            self._http_client = httpx.AsyncClient(
+                headers=self._headers,
+                timeout=httpx.Timeout(connect=30.0, read=180.0, write=30.0, pool=30.0),
+            )
+            return streamable_http_client(self._url, http_client=self._http_client)
+        return streamable_http_client(self._url)
+
+    async def disconnect(self) -> None:
+        await self._close_stack()
+        self._connected = False
+        self._session_invalidated = False
+        logger.info(f"MCP 已断开: {self._log_target()}")
+
+    async def _close_stack(self) -> None:
+        # 先关闭 MCP 上下文栈，再关闭自定义 httpx client
+        await super()._close_stack()
+        # streamable_http_client 不会关闭外部传入的 http_client，需手动关闭
+        if self._http_client is not None:
+            try:
+                await self._http_client.aclose()
+            except Exception as e:
+                logger.warning(f"关闭 httpx client 异常(忽略): {e}")
+            self._http_client = None
+
+    def _log_target(self) -> str:
+        return f"url={self._url}"
+
+
+class STDIOAdapter(MCPSDKAdapter):
+    """STDIO 模式适配器 - 通过子进程 stdin/stdout 通信"""
+
+    def __init__(self, command: str, args: Optional[list] = None, env: Optional[dict] = None, timeout: int = 30):
+        super().__init__(timeout=timeout)
+        # 若 command 含空格且不是已存在的文件路径，用 shlex 拆分为 command + args (Windows 兼容)
+        if command and " " in command and not os.path.exists(command):
+            parts = shlex.split(command, posix=False)
+            if parts:
+                command = parts[0]
+                extra_args = parts[1:]
+                args = list(extra_args) + list(args or [])
+        self._command = command or ""
+        self._args = list(args or [])
+        self._env = env or None
+
+    def _create_transport(self):
+        if not self._command:
+            raise MCPConnectException("STDIO模式缺少command参数")
+        params = StdioServerParameters(
+            command=self._command,
+            args=self._args,
+            env=self._env,
+        )
+        return stdio_client(params)
+
+    def _log_target(self) -> str:
+        return f"command={self._command}, args={self._args}"
 
 
 def create_mcp_adapter(mode: str, **kwargs) -> IMCPAdapter:
     """MCP 适配器工厂函数
 
     Args:
-        mode: "sse" 或 "stdio"
+        mode: "sse" / "streamable_http" / "stdio"
         **kwargs:
-            - SSE 模式: url(str), timeout(int, optional)
+            - SSE 模式: url(str), headers(dict, optional), timeout(int, optional)
+            - Streamable HTTP 模式: url(str), headers(dict, optional), timeout(int, optional)
             - STDIO 模式: command(str), args(list, optional), env(dict, optional), timeout(int, optional)
 
     Returns:
@@ -477,8 +398,14 @@ def create_mcp_adapter(mode: str, **kwargs) -> IMCPAdapter:
     mode_lower = (mode or "").lower()
     if mode_lower == "sse":
         url = kwargs.get("url", "")
+        headers = kwargs.get("headers")
         timeout = kwargs.get("timeout", 30)
-        return SSEAdapter(url=url, timeout=timeout)
+        return SSEAdapter(url=url, headers=headers, timeout=timeout)
+    elif mode_lower == "streamable_http":
+        url = kwargs.get("url", "")
+        headers = kwargs.get("headers")
+        timeout = kwargs.get("timeout", 30)
+        return StreamableHTTPAdapter(url=url, headers=headers, timeout=timeout)
     elif mode_lower == "stdio":
         command = kwargs.get("command", "")
         args = kwargs.get("args", None)
@@ -486,4 +413,4 @@ def create_mcp_adapter(mode: str, **kwargs) -> IMCPAdapter:
         timeout = kwargs.get("timeout", 30)
         return STDIOAdapter(command=command, args=args, env=env, timeout=timeout)
     else:
-        raise MCPException(f"不支持的MCP模式: {mode}. 仅支持 sse / stdio")
+        raise MCPException(f"不支持的MCP模式: {mode}. 仅支持 sse / streamable_http / stdio")

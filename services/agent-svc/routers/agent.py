@@ -28,6 +28,11 @@ class PolishPromptRequest(BaseModel):
     raw_prompt: str
 
 
+class PolishMCPDescriptionRequest(BaseModel):
+    raw_description: str
+    mode: str = ""  # MCP mode: streamable_http, sse, stdio
+
+
 class AgentMCPBindRequest(BaseModel):
     mcp_service_id: str
     config: dict = {}
@@ -229,4 +234,18 @@ async def polish_prompt(
     if not payload.raw_prompt or not payload.raw_prompt.strip():
         return ApiResponse(code=400, message="提示词内容不能为空")
     result = await agent_service.polish_system_prompt(db, payload.raw_prompt.strip())
+    return ApiResponse(data=result)
+
+
+@agent_router.post("/polish-mcp-description", response_model=ApiResponse)
+async def polish_mcp_description(
+    payload: PolishMCPDescriptionRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """AI 润色 MCP 服务描述 - 生成专业、规范的 MCP 服务描述"""
+    if not payload.raw_description or not payload.raw_description.strip():
+        return ApiResponse(code=400, message="描述内容不能为空")
+    result = await agent_service.polish_mcp_description(
+        db, payload.raw_description.strip(), payload.mode
+    )
     return ApiResponse(data=result)

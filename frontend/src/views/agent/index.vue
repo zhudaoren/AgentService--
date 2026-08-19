@@ -221,7 +221,7 @@
               <div class="panel-header">
                 <database-outlined />
                 <span>MCP 服务绑定</span>
-                <a-badge :count="mcpBindings.length" style="margin-left: 8px" />
+                <a-badge :count="mcpBindings.length" :color="mcpBindings.length > 0 ? '#1677ff' : '#d9d9d9'" style="margin-left: 8px" />
               </div>
             </template>
             <div class="panel-actions">
@@ -236,6 +236,7 @@
               :pagination="false"
               size="small"
               row-key="mcp_service_id"
+              :scroll="{ x: 530 }"
               :locale="{ emptyText: '尚未绑定 MCP 服务' }"
             >
               <template #bodyCell="{ column, record }">
@@ -243,8 +244,8 @@
                   <span class="binding-name">{{ record.name || record.mcp_name || '-' }}</span>
                 </template>
                 <template v-else-if="column.key === 'mode'">
-                  <a-tag :color="record.mode === 'sse' ? 'blue' : 'orange'">
-                    {{ record.mode === 'sse' ? 'SSE' : (record.mode || 'STDIO') }}
+                  <a-tag :color="mcpModeColor(record.mode)">
+                    {{ mcpModeText(record.mode) }}
                   </a-tag>
                 </template>
                 <template v-else-if="column.key === 'status'">
@@ -280,7 +281,7 @@
               <div class="panel-header">
                 <appstore-outlined />
                 <span>Skill 技能绑定</span>
-                <a-badge :count="skillBindings.length" style="margin-left: 8px" />
+                <a-badge :count="skillBindings.length" :color="skillBindings.length > 0 ? '#1677ff' : '#d9d9d9'" style="margin-left: 8px" />
               </div>
             </template>
             <div class="panel-actions">
@@ -295,6 +296,7 @@
               :pagination="false"
               size="small"
               row-key="skill_id"
+              :scroll="{ x: 400 }"
               :locale="{ emptyText: '尚未绑定 Skill 技能' }"
             >
               <template #bodyCell="{ column, record, index }">
@@ -445,8 +447,8 @@
       >
         <template #bodyCell="{ column, record }">
           <template v-if="column.key === 'mode'">
-            <a-tag :color="record.mode === 'sse' ? 'blue' : 'orange'">
-              {{ record.mode === 'sse' ? 'SSE' : 'STDIO' }}
+            <a-tag :color="mcpModeColor(record.mode)">
+              {{ mcpModeText(record.mode) }}
             </a-tag>
           </template>
           <template v-else-if="column.key === 'status'">
@@ -635,18 +637,18 @@ const mcpBindings = ref([])
 const skillBindings = ref([])
 
 const mcpBindingColumns = [
-  { title: 'MCP 服务', key: 'name', ellipsis: true },
-  { title: '模式', key: 'mode', width: 90 },
-  { title: '状态', key: 'status', width: 100 },
-  { title: '启用', key: 'enabled', width: 80 },
-  { title: '操作', key: 'action', width: 90 },
+  { title: 'MCP 服务', key: 'name', width: 160, ellipsis: true },
+  { title: '模式', key: 'mode', width: 130, ellipsis: true },
+  { title: '状态', key: 'status', width: 100, ellipsis: true },
+  { title: '启用', key: 'enabled', width: 70 },
+  { title: '操作', key: 'action', width: 70 },
 ]
 
 const skillBindingColumns = [
-  { title: 'Skill 名称', key: 'name', ellipsis: true },
-  { title: '优先级', key: 'priority', width: 120 },
-  { title: '启用', key: 'enabled', width: 80 },
-  { title: '操作', key: 'action', width: 90 },
+  { title: 'Skill 名称', key: 'name', width: 180, ellipsis: true },
+  { title: '优先级', key: 'priority', width: 80 },
+  { title: '启用', key: 'enabled', width: 70 },
+  { title: '操作', key: 'action', width: 70 },
 ]
 
 // MCP 选择器
@@ -660,10 +662,10 @@ const rowSelectionMCP = computed(() => ({
 }))
 
 const mcpPickerColumns = [
-  { title: '名称', dataIndex: 'name', key: 'name', ellipsis: true },
-  { title: '模式', key: 'mode', width: 100 },
-  { title: '状态', key: 'status', width: 100 },
-  { title: '工具数', dataIndex: 'tool_count', key: 'tool_count', width: 90 },
+  { title: '名称', dataIndex: 'name', key: 'name', width: 160, ellipsis: true },
+  { title: '模式', key: 'mode', width: 130, ellipsis: true },
+  { title: '状态', key: 'status', width: 100, ellipsis: true },
+  { title: '工具数', dataIndex: 'tool_count', key: 'tool_count', width: 80 },
 ]
 
 // Skill 选择器
@@ -743,6 +745,14 @@ function mcpStatusText(s) {
 function mcpStatusColor(s) {
   const map = { disconnected: 'default', connecting: 'gold', connected: 'green', error: 'red' }
   return map[s] || 'default'
+}
+function mcpModeText(mode) {
+  const map = { sse: 'SSE', streamable_http: 'Streamable HTTP', stdio: 'STDIO' }
+  return map[mode] || mode || '未知'
+}
+function mcpModeColor(mode) {
+  const map = { sse: 'blue', streamable_http: 'geekblue', stdio: 'orange' }
+  return map[mode] || 'default'
 }
 
 // ============ 数据加载 ============
@@ -825,33 +835,64 @@ async function openEdit(record) {
 async function loadBindings(agentId) {
   try {
     const [mcpRes, skillRes] = await Promise.all([
-      agentBindingApi.getMCPBindings(agentId).catch(() => []),
-      agentBindingApi.getSkillBindings(agentId).catch(() => []),
+      agentBindingApi.getMCPBindings(agentId).catch(e => {
+        console.error('加载MCP绑定失败:', e)
+        return []
+      }),
+      agentBindingApi.getSkillBindings(agentId).catch(e => {
+        console.error('加载Skill绑定失败:', e)
+        return []
+      }),
     ])
+    console.log('MCP绑定API响应:', mcpRes)
+    console.log('Skill绑定API响应:', skillRes)
+    
     const mcpList = Array.isArray(mcpRes)
       ? mcpRes
       : mcpRes?.items || mcpRes?.list || mcpRes?.data || []
     const skillList = Array.isArray(skillRes)
-      ? skillList
+      ? skillRes
       : skillRes?.items || skillRes?.list || skillRes?.data || []
-    mcpBindings.value = mcpList.map((b) => ({
-      ...b,
-      mcp_service_id: b.mcp_service_id ?? b.id,
-      enabled: b.enabled !== false,
-    }))
+    
+    console.log('解析后的MCP列表:', mcpList)
+    console.log('解析后的Skill列表:', skillList)
+    
+    mcpBindings.value = mcpList.map((b) => {
+      const mapped = {
+        ...b,
+        name: b.name || b.mcp_service_name || '',
+        mode: b.mode || b.mcp_service_mode || '',
+        status: b.status || b.mcp_service_status || '',
+        mcp_service_id: b.mcp_service_id ?? b.id,
+        enabled: b.enabled !== false,
+      }
+      console.log('MCP绑定项映射:', mapped)
+      return mapped
+    })
     skillBindings.value = skillList.map((b) => ({
       ...b,
+      name: b.name || b.skill_name || '',
       skill_id: b.skill_id ?? b.id,
       priority: b.priority ?? 100,
       enabled: b.enabled !== false,
     }))
+    
+    console.log('最终MCP绑定:', mcpBindings.value)
+    console.log('最终Skill绑定:', skillBindings.value)
+    
     originalMCPBindings.value = JSON.parse(JSON.stringify(mcpBindings.value))
     originalSkillBindings.value = JSON.parse(JSON.stringify(skillBindings.value))
+    
+    if (mcpBindings.value.length === 0 && skillBindings.value.length === 0) {
+      console.warn('Agent没有绑定任何MCP或Skill服务')
+    }
   } catch (e) {
+    console.error('加载绑定数据异常:', e)
     mcpBindings.value = []
     skillBindings.value = []
     originalMCPBindings.value = []
     originalSkillBindings.value = []
+    message.error('加载绑定数据失败: ' + (e?.message || '未知错误'))
   }
 }
 
@@ -1019,7 +1060,7 @@ async function openMCPBindPicker() {
   mcpPickerLoading.value = true
   availableMCPs.value = []
   try {
-    const res = await mcpApi.list({ page: 1, page_size: 200 })
+    const res = await mcpApi.list({ page: 1, page_size: 100 })
     const list = Array.isArray(res) ? res : res?.items || res?.list || res?.data || []
     const boundIds = new Set(mcpBindings.value.map((b) => String(b.mcp_service_id ?? b.id)))
     availableMCPs.value = list.filter((m) => !boundIds.has(String(m.id)))
@@ -1065,7 +1106,7 @@ async function openSkillBindPicker() {
   skillPickerLoading.value = true
   availableSkills.value = []
   try {
-    const res = await skillApi.list({ page: 1, page_size: 200 })
+    const res = await skillApi.list({ page: 1, page_size: 100 })
     const list = Array.isArray(res) ? res : res?.items || res?.list || res?.data || []
     const boundIds = new Set(skillBindings.value.map((b) => String(b.skill_id ?? b.id)))
     availableSkills.value = list.filter((s) => !boundIds.has(String(s.id)))
@@ -1350,5 +1391,32 @@ onMounted(() => {
   word-break: break-word;
   max-height: 120px;
   overflow: auto;
+}
+
+/* 表格自适应布局 */
+.page-agent :deep(.ant-table) {
+  table-layout: fixed;
+}
+
+.page-agent :deep(.ant-table .ant-table-cell) {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.page-agent :deep(.ant-table .ant-table-cell .ant-tag) {
+  max-width: 100%;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.binding-name {
+  display: inline-block;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  vertical-align: middle;
 }
 </style>

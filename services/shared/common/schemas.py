@@ -1,4 +1,6 @@
 """Pydantic 请求/响应模型"""
+from __future__ import annotations
+
 from datetime import datetime
 from typing import Any, Optional
 from pydantic import BaseModel, Field
@@ -62,6 +64,10 @@ class AgentCreate(BaseModel):
     max_tokens: int = 4096
     top_p: float = 0.9
     memory_strategy: str = "standard"
+    workflow_mode: str = Field(
+        "hybrid",
+        description="默认工作模式: react(边思考边行动) / plan_and_execute(先计划后执行) / hybrid(混合模式，自适应)",
+    )
     config: dict = {}
 
 
@@ -74,6 +80,7 @@ class AgentUpdate(BaseModel):
     max_tokens: Optional[int] = None
     top_p: Optional[float] = None
     memory_strategy: Optional[str] = None
+    workflow_mode: Optional[str] = None
     config: Optional[dict] = None
 
 
@@ -91,6 +98,7 @@ class AgentOut(BaseModel):
     max_tokens: int = 4096
     top_p: float = 0.9
     memory_strategy: str = "standard"
+    workflow_mode: str = "hybrid"
     config: dict = {}
     created_at: datetime
     updated_at: datetime
@@ -110,6 +118,7 @@ class ConversationCreate(BaseModel):
 class ConversationOut(BaseModel):
     id: str
     agent_id: str
+    agent_name: str = ""
     user_id: str = ""
     title: str = ""
     status: str = "active"
@@ -123,6 +132,7 @@ class MessageOut(BaseModel):
     conversation_id: str
     message_type: str
     content: str
+    thinking: Optional[str] = None
     tool_calls: Optional[dict] = None
     tool_results: Optional[dict] = None
     token_count: int = 0
@@ -133,6 +143,10 @@ class ChatRequest(BaseModel):
     conversation_id: str
     content: str
     stream: bool = True
+    workflow_mode: Optional[str] = Field(
+        None,
+        description="工作模式: react(边思考边行动) / plan_and_execute(先计划后执行) / hybrid(混合模式，默认hybrid)",
+    )
 
 
 # ── 记忆 ──────────────────────────────────────────────
@@ -173,8 +187,11 @@ class MCPSTDIOConfig(BaseModel):
 class MCPServiceCreate(BaseModel):
     name: str = Field(..., max_length=128)
     description: str = ""
-    mode: str = Field(..., description="sse 或 stdio")
+    mode: str = Field(..., description="sse / streamable_http / stdio")
     sse_url: str = ""
+    auth_type: str = Field(default="none", description="认证类型: none / bearer / basic / custom / oauth")
+    headers: dict = Field(default_factory=dict, description="HTTP 请求头（远程模式认证用）")
+    oauth_config: dict = Field(default_factory=dict, description="OAuth 2.1 配置（client_id/client_secret/scopes/redirect_uri/auth_server_url）")
     stdio_config: dict = {}
     status: str = "disconnected"
 
@@ -184,6 +201,9 @@ class MCPServiceUpdate(BaseModel):
     description: Optional[str] = None
     mode: Optional[str] = None
     sse_url: Optional[str] = None
+    auth_type: Optional[str] = None
+    headers: Optional[dict] = None
+    oauth_config: Optional[dict] = None
     stdio_config: Optional[dict] = None
     status: Optional[str] = None
     error_message: Optional[str] = None
@@ -195,6 +215,11 @@ class MCPServiceOut(BaseModel):
     description: str = ""
     mode: str
     sse_url: str = ""
+    auth_type: str = "none"
+    headers: dict = {}
+    oauth_config: dict = {}
+    oauth_tokens: dict = {}
+    oauth_status: str = "not_configured"
     stdio_config: dict = {}
     status: str = "disconnected"
     error_message: str = ""

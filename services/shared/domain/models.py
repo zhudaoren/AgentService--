@@ -46,6 +46,7 @@ class Agent(Base):
     max_tokens: Mapped[int] = mapped_column(Integer, default=4096)
     top_p: Mapped[float] = mapped_column(Float, default=0.9)
     memory_strategy: Mapped[str] = mapped_column(String(32), default="standard")
+    workflow_mode: Mapped[str] = mapped_column(String(32), default="hybrid")
     config: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -93,7 +94,8 @@ class Message(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     conversation_id: Mapped[str] = mapped_column(String(36), ForeignKey("conversations.id", ondelete="CASCADE"), nullable=False)
     message_type: Mapped[str] = mapped_column(Enum("user", "assistant", "system", "tool_call", "tool_result", "error"), nullable=False)
-    content: Mapped[str] = mapped_column(Text, nullable=False)
+    content: Mapped[str] = mapped_column(Text().with_variant(Text(length=16777215), "mysql"), nullable=False)
+    thinking: Mapped[Optional[str]] = mapped_column(Text().with_variant(Text(length=16777215), "mysql"), nullable=True)
     tool_calls: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
     tool_results: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
     token_count: Mapped[int] = mapped_column(Integer, default=0)
@@ -112,8 +114,14 @@ class MCPService(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     name: Mapped[str] = mapped_column(String(128), nullable=False)
     description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    mode: Mapped[str] = mapped_column(Enum("sse", "stdio"), nullable=False)
+    mode: Mapped[str] = mapped_column(Enum("sse", "stdio", "streamable_http"), nullable=False)
     sse_url: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
+    auth_type: Mapped[str] = mapped_column(String(32), default="none", nullable=False)
+    headers: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    # OAuth 2.1 字段
+    oauth_config: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    oauth_tokens: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    oauth_status: Mapped[str] = mapped_column(String(32), default="not_configured", nullable=False)
     stdio_config: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
     status: Mapped[str] = mapped_column(
         Enum("disconnected", "connecting", "connected", "error"),

@@ -1,8 +1,12 @@
 """Skill 业务服务 - CRUD + 导入 + 渐进式披露"""
+from __future__ import annotations
+
 import json
 import os
 import re
 import uuid
+import zipfile
+import io
 from datetime import datetime
 from typing import Any, Optional
 
@@ -275,11 +279,11 @@ class SkillImportService:
         content_bytes: bytes,
         content_type: str,
     ) -> SkillOut:
-        """从本地文件导入 Skill"""
+        """从本地文件导入 Skill（支持 .md/.json/.skill/.txt/.zip）"""
         ext = os.path.splitext(filename)[1].lower()
 
         if ext == ".zip":
-            raise BadRequestException(".zip 格式暂不支持，请使用 .md/.json/.skill/.txt")
+            return await self._import_from_zip(db, filename, content_bytes)
 
         try:
             text = content_bytes.decode("utf-8", errors="replace")
@@ -351,6 +355,133 @@ class SkillImportService:
 
         logger.info(f"Skill本地文件导入成功: id={skill_id}, filename={filename}")
         return await skill_service.get(db, skill_id, with_levels=True)
+
+    async def _import_from_zip(
+        self,
+        db: AsyncSession,
+        filename: str,
+        content_bytes: bytes,
+    ) -> SkillOut:
+        """从 ZIP 文件导入多文件结构 Skill"""
+        self._init_storage()
+        date_str = datetime.utcnow().strftime("%Y-%m-%d")
+        date_dir = os.path.join(UPLOAD_ROOT, date_str)
+        safe_uuid = uuid.uuid4().hex
+        extract_dir = os.path.join(date_dir, safe_uuid)
+        storage_path = f"local/{date_str}/{safe_uuid}"
+
+        # 解压 ZIP
+        try:
+            os.makedirs(extract_dir, exist_ok=True)
+            with zipfile.ZipFile(io.BytesIO(content_bytes), 'r') as zf:
+                # 安全检查：防止路径穿越
+                for name in zf.namelist():
+                    if name.startswith('/') or '..' in name:
+                        raise BadRequestException(f"ZIP文件包含不安全路径: {name}")
+                zf.extractall(extract_dir)
+        except zipfile.BadZipFile:
+            raise BadRequestException("无效的ZIP文件")
+        except BadRequestException:
+            raise
+        except Exception as e:
+            raise BadRequestException(f"ZIP解压失败: {e}")
+
+        # 查找 SKILL.md（支持多层目录）
+        skill_md_path = self._find_skill_md(extract_dir)
+        if not skill_md_path:
+            raise BadRequestException("ZIP中未找到 SKILL.md 文件")
+
+        # 读取并解析 SKILL.md
+        try:
+            with open(skill_md_path, 'r', encoding='utf-8') as f:
+                skill_md_content = f.read()
+        except Exception as e:
+            raise ValidationException(f"SKILL.md 读取失败: {e}")
+
+        parsed = self._parse_markdown_skill(skill_md_content)
+
+        name = parsed.get("name") or os.path.splitext(filename)[0]
+        description = parsed.get("description", "") or ""
+        category = parsed.get("category", "general") or "general"
+        author = parsed.get("author", "") or ""
+        tags = parsed.get("tags") or []
+        body = parsed.get("body", "") or skill_md_content
+
+        # 收集附加文件信息
+        skill_dir = os.path.dirname(skill_md_path)
+        has_scripts = os.path.exists(os.path.join(skill_dir, "scripts"))
+        has_references = os.path.exists(os.path.join(skill_dir, "references"))
+        has_assets = os.path.exists(os.path.join(skill_dir, "assets"))
+
+        # 构建扩展描述
+        extensions = []
+        if has_scripts:
+            extensions.append("scripts(可执行脚本)")
+        if has_references:
+            extensions.append("references(参考文档)")
+        if has_assets:
+            extensions.append("assets(资源文件)")
+        if extensions and description:
+            description += f" [包含: {', '.join(extensions)}]"
+        elif extensions:
+            description = f"包含 {', '.join(extensions)} 的技能包"
+
+        # 创建 Skill 记录
+        skill_payload = SkillCreate(
+            name=name,
+            description=description,
+            category=category,
+            version="1.0.0",
+            source="local",
+            source_url="",
+            enabled=True,
+            author=author,
+            tags=tags,
+            levels=[],
+        )
+        skill_out = await skill_service.create(db, skill_payload)
+
+        # 构建 3 级 levels（包含扩展文件信息）
+        levels_bodies = self._build_three_levels(
+            name, description, tags, category, body,
+            skill_dir=skill_dir,
+            has_scripts=has_scripts,
+            has_references=has_references,
+            has_assets=has_assets,
+        )
+        skill_id = skill_out.id
+        for lv_idx, (lv_name, lv_content) in enumerate(levels_bodies):
+            level_obj = SkillLevel(
+                id=uuid.uuid4().hex,
+                skill_id=skill_id,
+                level=lv_idx,
+                name=lv_name,
+                content=lv_content,
+                token_count=SkillManager.estimate_tokens(lv_content),
+            )
+            db.add(level_obj)
+        await db.flush()
+
+        from sqlalchemy import update as sql_update
+        await db.execute(
+            sql_update(Skill).where(Skill.id == skill_id).values(storage_path=storage_path)
+        )
+        await db.flush()
+
+        logger.info(f"Skill ZIP导入成功: id={skill_id}, name={name}, "
+                     f"scripts={has_scripts}, references={has_references}, assets={has_assets}")
+        return await skill_service.get(db, skill_id, with_levels=True)
+
+    @staticmethod
+    def _find_skill_md(root_dir: str) -> Optional[str]:
+        """递归查找 SKILL.md 文件"""
+        for root, dirs, files in os.walk(root_dir):
+            # 跳过 __MACOSX 等系统目录
+            dirs[:] = [d for d in dirs if not d.startswith('_')]
+            for file in files:
+                if file.upper() == "SKILL.MD":
+                    return os.path.join(root, file)
+        return None
 
     async def import_from_url(
         self,
@@ -547,11 +678,35 @@ class SkillImportService:
         tags: list,
         category: str,
         body: str,
+        skill_dir: Optional[str] = None,
+        has_scripts: bool = False,
+        has_references: bool = False,
+        has_assets: bool = False,
     ) -> list[tuple[str, str]]:
-        """生成 3 级 levels"""
+        """生成 3 级 levels（支持多文件结构 Skill）"""
         tags_str = ""
         if tags:
             tags_str = " #" + " #".join([str(t) for t in tags[:5]])
+
+        # 构建多文件扩展信息
+        extensions_info = []
+        if has_scripts and skill_dir:
+            scripts_dir = os.path.join(skill_dir, "scripts")
+            scripts_files = SkillImportService._list_files(scripts_dir)
+            extensions_info.append(f"- **scripts/**: 包含 {len(scripts_files)} 个可执行脚本\n"
+                                   f"  - {', '.join(scripts_files[:5])}")
+        if has_references and skill_dir:
+            refs_dir = os.path.join(skill_dir, "references")
+            refs_files = SkillImportService._list_files(refs_dir)
+            extensions_info.append(f"- **references**: 包含 {len(refs_files)} 个参考文档\n"
+                                   f"  - {', '.join(refs_files[:5])}")
+        if has_assets and skill_dir:
+            assets_dir = os.path.join(skill_dir, "assets")
+            assets_files = SkillImportService._list_files(assets_dir)
+            extensions_info.append(f"- **assets**: 包含 {len(assets_files)} 个资源文件\n"
+                                   f"  - {', '.join(assets_files[:5])}")
+
+        extensions_block = "\n".join(extensions_info) if extensions_info else ""
 
         lv0_name = "概要索引"
         lv0_content = (
@@ -559,8 +714,10 @@ class SkillImportService:
             f"分类: {category}\n"
             f"简短描述: {description or '无'}\n"
             f"标签: {tags_str.strip() or '无'}\n"
-            f"使用提示: 这是技能 {name} 的 Level 0 概要。"
         )
+        if extensions_block:
+            lv0_content += f"\n扩展文件:\n{extensions_block}\n"
+        lv0_content += f"使用提示: 这是技能 {name} 的 Level 0 概要。"
 
         lv1_name = "完整使用说明"
         main_body = body.strip()
@@ -569,8 +726,10 @@ class SkillImportService:
         lv1_content = (
             f"# {name} - 完整使用说明\n\n"
             f"## 描述\n{description or name}\n\n"
-            f"## 详细内容\n{main_body}"
         )
+        if extensions_block:
+            lv1_content += f"## 扩展文件结构\n{extensions_block}\n\n"
+        lv1_content += f"## 详细内容\n{main_body}"
 
         advanced, tips, boundary = "", "", ""
         for section_name, section_content in SkillImportService._extract_sections(body).items():
@@ -583,6 +742,13 @@ class SkillImportService:
             advanced = f"\n### 高级技巧\n请结合 Level 1 的使用说明，根据实际场景灵活运用技能 {name}。\n"
         if not boundary:
             boundary = f"\n### 边界与注意事项\n- 使用前请确认输入数据格式正确\n- 如遇异常，请检查参数并重新尝试\n"
+
+        # 读取 references 目录中的文件作为深度补充
+        refs_content = ""
+        if has_references and skill_dir:
+            refs_dir = os.path.join(skill_dir, "references")
+            refs_content = SkillImportService._read_references(refs_dir)
+
         tips_body = body.strip() if body.strip() else description
         if len(tips_body) > 15000:
             tips_body = tips_body[:15000]
@@ -590,10 +756,51 @@ class SkillImportService:
         lv2_content = (
             f"# {name} - Level 2 深度说明\n\n"
             f"## 正文详情\n{tips_body}\n\n"
+        )
+        if extensions_block:
+            lv2_content += f"## 扩展文件详情\n{extensions_block}\n\n"
+        if refs_content:
+            lv2_content += f"## 参考文档内容\n{refs_content}\n\n"
+        lv2_content += (
             f"## 高级技巧与案例\n{advanced}\n\n"
             f"## 边界与注意事项\n{boundary}\n"
         )
         return [(lv0_name, lv0_content), (lv1_name, lv1_content), (lv2_name, lv2_content)]
+
+    @staticmethod
+    def _list_files(directory: str) -> list[str]:
+        """列出目录下的文件名（非递归）"""
+        files = []
+        try:
+            for f in os.listdir(directory):
+                if os.path.isfile(os.path.join(directory, f)):
+                    files.append(f)
+        except Exception:
+            pass
+        return files
+
+    @staticmethod
+    def _read_references(refs_dir: str, max_tokens: int = 5000) -> str:
+        """读取 references 目录中的 Markdown 文档"""
+        content_parts = []
+        try:
+            for fname in sorted(os.listdir(refs_dir)):
+                if fname.endswith(('.md', '.markdown', '.txt')):
+                    fpath = os.path.join(refs_dir, fname)
+                    try:
+                        with open(fpath, 'r', encoding='utf-8') as f:
+                            text = f.read()
+                        if len(text) > 2000:
+                            text = text[:2000] + "\n...(截断)"
+                        content_parts.append(f"### {fname}\n{text}")
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        result = "\n\n".join(content_parts)
+        if len(result) > max_tokens * 4:
+            result = result[:max_tokens * 4] + "\n\n...(按预算截断)"
+        return result
 
     @staticmethod
     def _extract_sections(text: str) -> dict[str, str]:

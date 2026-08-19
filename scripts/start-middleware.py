@@ -24,7 +24,7 @@ from urllib.request import urlopen
 IMAGES = [
     {"image": "mysql:8.0",                                  "container": "agent-mysql",          "port": 3306},
     {"image": "redis:7-alpine",                             "container": "agent-redis",          "port": 6379},
-    {"image": "minio/minio:RELEASE.2024-01-01T00-00-00Z",   "container": "agent-minio",          "port": 9000},
+    {"image": "minio/minio:RELEASE.2024-10-13T13-34-11Z",   "container": "agent-minio",          "port": 9000},
     {"image": "quay.io/coreos/etcd:v3.5.5",                 "container": "agent-milvus-etcd",    "port": None},
     {"image": "minio/minio:RELEASE.2023-03-20T20-16-18Z",    "container": "agent-milvus-minio",   "port": None},
     {"image": "milvusdb/milvus:v2.4.0",                     "container": "agent-milvus",         "port": 19530},
@@ -96,13 +96,49 @@ def wait_for_service(name: str, check_fn, timeout: int = 60, interval: int = 2) 
     err("超时")
     return False
 
+# ── .env 解析 ──────────────────────────────────────
+
+def load_env_file(path: Path) -> dict:
+    """解析 .env 文件，返回 dict"""
+    env = {}
+    if not path.exists():
+        return env
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" in line:
+            key, _, val = line.partition("=")
+            key = key.strip()
+            val = val.strip().strip('"').strip("'")
+            if key:
+                env[key] = val
+    return env
+
+
+# 运行时加载 .env 配置
+_ENV = load_env_file(Path(__file__).parent.parent / ".env")
+
+MYSQL_ROOT_PASSWORD = _ENV.get("MYSQL_ROOT_PASSWORD", "root123")
+REDIS_PASSWORD = _ENV.get("REDIS_PASSWORD", "")
+
+
 def check_mysql() -> bool:
-    r = run(["docker", "exec", "agent-mysql", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-proot123"])
+    cmd = ["docker", "exec", "agent-mysql", "mysqladmin", "ping", "-h", "localhost", "-uroot"]
+    pwd = MYSQL_ROOT_PASSWORD
+    if pwd:
+        cmd.append(f"-p{pwd}")
+    r = run(cmd)
     return r.returncode == 0
 
+
 def check_redis() -> bool:
-    r = run(["docker", "exec", "agent-redis", "redis-cli", "ping"])
-    return "PONG" in r.stdout
+    cmd = ["docker", "exec", "agent-redis", "redis-cli"]
+    if REDIS_PASSWORD:
+        cmd += ["-a", REDIS_PASSWORD]
+    cmd += ["ping"]
+    r = run(cmd)
+    return r.returncode == 0
 
 def check_minio() -> bool:
     try:

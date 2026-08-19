@@ -22,6 +22,13 @@ from urllib.request import urlopen
 
 # ── 配置 ──────────────────────────────────────────────
 
+# Conda 虚拟环境 Python 路径（可通过环境变量 AGENT_SERVICE_PYTHON 覆盖）
+CONDA_ENV_NAME = "AgentService"
+DEFAULT_PYTHON = os.path.expanduser(
+    f"~/.conda/envs/{CONDA_ENV_NAME}/python.exe"
+)
+PYTHON_EXECUTABLE = os.environ.get("AGENT_SERVICE_PYTHON", DEFAULT_PYTHON)
+
 SERVICES = [
     {"name": "gateway",   "port": 8000, "dir": "gateway"},
     {"name": "agent-svc", "port": 8001, "dir": "agent-svc"},
@@ -60,20 +67,28 @@ def warn(msg):   print(f"  {Color.YELLOW}⚠ {msg}{Color.NC}")
 def err(msg):    print(f"  {Color.RED}✗ {msg}{Color.NC}")
 
 def check_python_deps():
-    """检查 Python 依赖"""
+    """检查 Python 依赖（使用指定的 conda 环境 Python）"""
+    info(f"使用 Python: {PYTHON_EXECUTABLE}")
+
+    # 验证 Python 可执行文件存在
+    if not Path(PYTHON_EXECUTABLE).exists():
+        err(f"Python 可执行文件不存在: {PYTHON_EXECUTABLE}")
+        print(f"\n请确认 conda 环境 '{CONDA_ENV_NAME}' 已创建，或通过环境变量 AGENT_SERVICE_PYTHON 指定路径")
+        sys.exit(1)
+
     info("检查 Python 依赖...")
     missing = []
     for pkg in PYTHON_DEPS:
-        try:
-            __import__(pkg)
-        except ImportError:
+        r = subprocess.run(
+            [PYTHON_EXECUTABLE, "-c", f"import {pkg}"],
+            capture_output=True, text=True
+        )
+        if r.returncode != 0:
             missing.append(pkg)
     if missing:
         err(f"缺少以下 Python 依赖: {', '.join(missing)}")
-        print("\n请安装依赖:")
-        print("  pip install fastapi uvicorn 'sqlalchemy[asyncio]' aiomysql")
-        print("    pydantic pydantic-settings redis cryptography httpx")
-        print("    aiohttp minio pymilvus python-multipart")
+        print(f"\n请在 '{CONDA_ENV_NAME}' 环境中安装依赖:")
+        print(f"  {PYTHON_EXECUTABLE} -m pip install -r requirements.txt")
         sys.exit(1)
     ok("Python 依赖检查通过")
 
@@ -212,13 +227,16 @@ def main():
 
         env = os.environ.copy()
         env["PYTHONPATH"] = f"{shared_path}{os.pathsep}."
+        # Fix Windows GBK encoding issues with emoji/Unicode in logs
+        env["PYTHONIOENCODING"] = "utf-8"
+        env["PYTHONUTF8"] = "1"
 
         if args.daemon:
             # 后台模式：完全脱离终端
             if platform.system() == "Windows":
                 # Windows 使用 CREATE_NEW_PROCESS_GROUP
                 p = subprocess.Popen(
-                    [sys.executable, "-m", "uvicorn", "main:app",
+                    [PYTHON_EXECUTABLE, "-m", "uvicorn", "main:app",
                      "--host", "0.0.0.0", "--port", str(port)],
                     cwd=str(svc_dir),
                     env=env,
@@ -228,7 +246,7 @@ def main():
                 )
             else:
                 p = subprocess.Popen(
-                    [sys.executable, "-m", "uvicorn", "main:app",
+                    [PYTHON_EXECUTABLE, "-m", "uvicorn", "main:app",
                      "--host", "0.0.0.0", "--port", str(port)],
                     cwd=str(svc_dir),
                     env=env,
@@ -241,7 +259,7 @@ def main():
         else:
             # 前台模式
             p = subprocess.Popen(
-                [sys.executable, "-m", "uvicorn", "main:app",
+                [PYTHON_EXECUTABLE, "-m", "uvicorn", "main:app",
                  "--host", "0.0.0.0", "--port", str(port)],
                 cwd=str(svc_dir),
                 env=env,

@@ -7,6 +7,8 @@
   Level 1 (完整):  3000 tokens 预算 - 单个 Skill 的完整使用说明 + 典型场景
   Level 2 (深度): 10000 tokens 预算 - 单个 Skill 的深度内容(案例/代码/详细步骤)
 """
+from __future__ import annotations
+
 import re
 from typing import Any
 

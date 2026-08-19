@@ -17,6 +17,8 @@
       "shared_items": []         # 共享记忆项
   }
 """
+from __future__ import annotations
+
 import copy
 import json
 import uuid

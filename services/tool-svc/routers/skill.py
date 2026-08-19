@@ -121,14 +121,14 @@ async def import_skill_local(
     file: UploadFile = File(...),
     db: AsyncSession = Depends(get_db),
 ):
-    """本地文件导入：支持 .skill/.zip/.json/.md"""
+    """本地文件导入：支持 .md/.json/.skill/.txt/.zip（多文件结构）"""
     if not file.filename:
         raise HTTPException(status_code=400, detail="缺少文件名")
-    allowed_exts = (".skill", ".zip", ".json", ".md", ".txt")
+    allowed_exts = (".md", ".json", ".skill", ".txt", ".zip")
     if not file.filename.lower().endswith(allowed_exts):
         raise HTTPException(
             status_code=400,
-            detail=f"不支持的文件类型，仅支持: {', '.join(allowed_exts)}",
+            detail=f"不支持的文件类型，仅支持: {', '.join(allowed_exts)}。.zip 用于导入多文件结构 Skill",
         )
     content_bytes = await file.read()
     content_type = file.content_type or ""

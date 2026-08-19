@@ -3,6 +3,8 @@
 统一封装 OpenAI / Claude / Qwen / DeepSeek / Ollama 等主流 LLM，
 提供同步调用、流式调用两种模式。
 """
+from __future__ import annotations
+
 import uuid
 from typing import Any, AsyncIterator, Optional
 

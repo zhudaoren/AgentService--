@@ -14,6 +14,8 @@ cache_key 格式: f"short_term:{conversation_id}"
 value: JSON 序列化的消息列表 (list[dict])
 TTL: 24 小时 = 86400 秒
 """
+from __future__ import annotations
+
 import json
 import time
 from typing import Any, Optional

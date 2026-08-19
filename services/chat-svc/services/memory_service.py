@@ -8,6 +8,8 @@ P1阶段直接读取数据库，不做远程调用。后续Phase可改造为远�
   - build_system_prompt: 组合 system_prompt + 长期记忆 + 上下文压缩提示
   - 上下文压缩 (T1-027): 历史消息 token 总和 > 阈值时，只取最近 10 条
 """
+from __future__ import annotations
+
 from typing import Any, Optional
 
 from sqlalchemy import select
