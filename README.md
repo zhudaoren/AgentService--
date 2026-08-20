@@ -2,7 +2,7 @@
 
 > 基于 AgenticRAG + LangChain + LangGraph + FastAPI + Vue3 的智能体服务平台
 
-**当前版本：Phase 2（对话与工具域）** — LLM接入 + Agent管理 + 流式对话 + 记忆管理 + MCP双模式接入 + Skill渐进式披露 + 工具调用ReAct循环 + 记忆深化(Redis/Milvus)
+**当前版本：Phase 2.1（对话与工具域 + 智能化增强）** — LLM接入 + Agent管理 + 流式对话 + 记忆管理 + MCP双模式接入 + Skill渐进式披露与按需筛选 + 工具调用ReAct循环 + 长期记忆自动评估 + 流式思考/回答事件分离 + Plan-and-Execute工作模式 + 记忆深化(Redis/Milvus)
 
 ---
 
@@ -273,12 +273,15 @@ npm run dev
 
 #### 8. 开始使用
 
-1. 打开 `http://localhost:5173` → 进入**LLM配置**页面，添加你的LLM配置（如OpenAI API Key）
+1. 打开 `http://localhost:5173` → 进入**LLM配置**页面，添加你的LLM配置（如OpenAI / DeepSeek API Key）
 2. 进入**MCP服务管理**页面，创建MCP服务（SSE/STDIO双模式），连接后自动发现工具
 3. 进入**Skill管理**页面，导入或创建Skill（支持本地文件/在线URL导入）
-4. 进入**Agent管理**页面，创建一个Agent并选择LLM配置，绑定MCP服务和Skill
-5. 进入**对话**页面，选择Agent创建会话，开始对话 → 自动触发ReAct工具调用循环
-6. 在**记忆查看器**页面查看和编辑Agent的长期记忆
+4. 进入**Agent管理**页面，创建一个Agent并选择LLM配置，设置 `workflow_mode`（ReAct / Plan-and-Execute / Hybrid），绑定MCP服务和Skill
+5. 进入**对话**页面，选择Agent创建会话，开始对话：
+   - 自动触发 ReAct / Plan-and-Execute 工具调用循环
+   - 思考过程与最终回答分离展示，思考区显示时长统计
+   - 技能按用户查询关键词按需筛选加载
+6. 多轮对话后，进入**记忆查看器**页面查看长期记忆（自动从对话历史中提炼的偏好/事实/经验）
 
 ---
 
@@ -400,11 +403,11 @@ curl http://localhost:8003/healthz  # tool-svc
 |------|------|------|
 | GET | /agents/{id}/long-term | 获取长期记忆 |
 | PUT | /agents/{id}/long-term | 更新长期记忆 |
-| GET | /agents/{id}/long-term/summary | 记忆摘要 |
+| GET | /agents/{id}/long-term/summary | 记忆摘要（含实际内容字段，便于摘要弹窗展示） |
 | GET | /agents/{id}/short-term/{conv_id} | 短期记忆（优先Redis缓存） |
 | DELETE | /agents/{id}/short-term/cache | 清除短期记忆缓存 |
-| POST | /agents/{id}/long-term/evaluate | 对话结束评估更新长期记忆 |
-| POST | /agents/{id}/long-term/search | 长期记忆语义检索 |
+| POST | /evaluate | **(P2.1)** 对话结束评估更新长期记忆（chat-svc 异步调用，best-effort） |
+| POST | /semantic-search | **(P2.1)** 长期记忆语义检索（Milvus 未集成，关键词匹配降级） |
 
 ### MCP 服务管理（网关 /api/v1/mcp）
 
@@ -474,6 +477,65 @@ Skill加载遵循3级：
 
 ---
 
+## P2.1 新增：智能化增强使用指南
+
+### 长期记忆自动评估
+
+多轮对话结束后，chat-svc 会**异步**调用 mem-svc 的 `/api/v1/memory/evaluate` 接口，自动从对话历史中提炼值得持久化的信息：
+
+1. chat-svc `_trigger_memory_evaluation`：best-effort 模式，失败不影响主对话
+2. mem-svc `evaluate_memory`：加载 Agent 的 LLM 配置，动态创建适配器（复用 Agent 绑定模型）
+3. LLM 按结构化 Prompt 返回 JSON：`{should_update, updates:[{segment, action, key, value}]}`
+4. 按 segment（`user_profile` / `environment_facts` / `experience`）分别应用更新，version+1 持久化
+
+> 验证方式：发起多轮对话后，进入**记忆查看器**页面查看长期记忆，应能看到从对话中提炼的偏好/事实/经验。
+
+### 流式思考/回答事件分离
+
+解决多轮 ReAct 推理中最终回答"先出现在思考区块、再迁移到回答区块"的视觉错位：
+
+- 后端缓冲每轮 LLM content，流结束后根据 `has_tool_calls` 判断推送事件：
+  - 中间轮（有 tool_calls）→ `thinking` 事件 → 思考区块
+  - 最终轮（无 tool_calls）→ `message` 事件 → 回答区块
+- 前端 `thinking_to_answer` 事件仅保留中间推理或清空思考区，不做迁移
+- 思考区块显示时长统计（累加每轮 `duration_ms`）
+
+### 技能按需筛选
+
+避免所有 Skill 全量加载导致上下文开销过大：
+
+- 关键词提取：中文 2/3/4 字滑动窗口 + 英文驼峰/分隔符拆分
+- 两级匹配：**名称直接命中（强相关）优先**；描述命中（弱相关）次选
+- 有名称命中时**只返回名称命中的技能**，排除纯描述匹配
+- 无任何命中 → 回退全量（保守策略）
+
+### Plan-and-Execute 工作模式
+
+创建 Agent 时选择 `workflow_mode=plan-and-execute`：
+
+1. LLM 先生成 `steps[]` 计划清单 → SSE 推送 `plan_generated` 事件
+2. 前端渲染 checklist 卡片 + 状态指示器
+3. 按 steps 顺序逐步执行，每步更新状态
+4. 所有步骤完成后调用 LLM 综合总结输出最终回答
+
+### DeepSeek R1 reasoning_content 回传
+
+DeepSeek R1 系列思考模型的 reasoning token 会逐块累积并回传下一轮，避免 API 400 错误。无需用户干预，由 `llm_adapter.py` 自动处理。
+
+### MCP web_search fallback
+
+当绑定的 web_search MCP 服务不可用时，自动降级到 DuckDuckGo 搜索 + 结构化 mock，不阻断 ReAct 循环。
+
+### Mermaid 图表渲染
+
+LLM 回答中的 ` ```mermaid ` 代码块会被自动渲染为可视化图形：
+
+- 工具栏切换"图形/源码"视图
+- 渲染失败时回退显示源码 + 错误提示（不导致 UI 崩溃）
+- 支持 dark mode 与自适应样式
+
+---
+
 ## P2 功能清单
 
 ### MCP 双模式接入
@@ -483,6 +545,8 @@ Skill加载遵循3级：
 - [x] 自动发现工具并持久化
 - [x] 工具粒度启用/禁用开关
 - [x] 工具调用日志记录（入参/结果/耗时）
+- [x] **(P2.1)** web_search 内置 fallback（MCP不可用时走 DuckDuckGo + 结构化 mock）
+- [x] **(P2.1)** OAuth 2.0 认证流程路由（支持 GitHub/Google 等 provider）
 
 ### Skills 技能管理
 - [x] Skill CRUD + 3级渐进式披露结构（Level0/1/2）
@@ -490,6 +554,7 @@ Skill加载遵循3级：
 - [x] 在线URL导入（HTTP拉取+自动解析）
 - [x] 渐进式Prompt构建（按Token预算截断）
 - [x] Agent绑定Skill（优先级/开关）
+- [x] **(P2.1)** 按需筛选：基于用户查询关键词动态筛选相关 Skill（名称优先匹配，中文滑动窗口 + 英文驼峰拆分）
 
 ### 对话增强（ReAct）
 - [x] ReAct完整循环：Thought → ToolCall → Observation → 最多8轮
@@ -497,21 +562,45 @@ Skill加载遵循3级：
 - [x] 文本模式兜底：从文本解析ACTION/ARGS调用工具
 - [x] 工具调用SSE事件 + 前端可视化卡片
 - [x] 对话重新生成（删除最后消息+重跑）
+- [x] **(P2.1)** 流式思考/回答事件分离（后端缓冲 + `has_tool_calls` 路由，最终回答不再先显示在思考区）
+- [x] **(P2.1)** Plan-and-Execute 工作模式（计划生成 → 分步执行 → 综合总结 LLM 调用）
+- [x] **(P2.1)** DeepSeek R1 reasoning_content 回传（思考 token 累积，避免下一轮 API 400 错误）
+- [x] **(P2.1)** LLM 调用失败 graceful degradation（已有回答 + 错误提示）
+- [x] **(P2.1)** 单 SSE 事件异常隔离（onMessage/onDone/onError 全局 try/catch）
 
 ### 记忆深化
 - [x] 短期记忆Redis缓存（活跃会话24h TTL，未命中fallback MySQL）
 - [x] 长期记忆评估更新（对话结束LLM评估→持久化，P2含占位降级）
 - [x] 长期记忆语义检索（Milvus占位，P2关键词匹配降级）
 - [x] 短期记忆缓存失效接口
+- [x] **(P2.1)** 长期记忆自动评估链路（chat-svc → mem-svc `/evaluate`，异步 best-effort 触发）
+- [x] **(P2.1)** mem-svc 动态加载 Agent 的 LLM 配置创建适配器（复用 Agent 绑定模型）
+- [x] **(P2.1)** 记忆摘要返回实际内容字段（user_profile/environment_facts/experience/shared_items）
+
+### 前端交互增强
+- [x] **(P2.1)** 用户消息复制/删除/回撤功能
+- [x] **(P2.1)** Agent 最终回答复制按钮
+- [x] **(P2.1)** Mermaid 图表渲染组件（图形/源码切换 + 失败兜底）
+- [x] **(P2.1)** Plan-and-Execute 计划卡片（checklist 样式 + 状态指示器）
+- [x] **(P2.1)** 工作模式徽标显示（ReAct / Plan-and-Execute / Hybrid）
+- [x] **(P2.1)** 关键词高亮修复（`indexOf` 替代动态正则，无 SyntaxError）
+- [x] **(P2.1)** 历史对话刷新工具状态正确合并（修复"执行中"卡死）
+- [x] **(P2.1)** 区块固定顺序：工作模式 → 思考 → 技能 → 工具 → 最终回答
 
 ---
 
 ## 项目结构
 
 ```
-agent-service-platform/
+agent-service-platform-phase1/
 ├── docker-compose.yml              # Docker一键部署
 ├── .env.example                    # 环境变量模板
+├── requirements.txt                # Python 统一依赖
+├── _launch_backends.py             # 后端一键启动（5 个服务）
+├── _selftest_chat.py               # 聊天自测脚本（SSE + 持久化验证）
+├── P1阶段代码修改文档.md             # P1 阶段代码修改文档
+├── P2阶段代码修改文档.md             # P2 阶段代码修改文档（含 bd861bc 迭代）
+├── P2阶段软件测试文档.md             # P2 阶段软件测试文档 v2.0
 ├── .gitignore
 │
 ├── scripts/                        # 启动/停止脚本
@@ -522,20 +611,24 @@ agent-service-platform/
 │   ├── start-backend.sh            # 后端服务一键启动 (Linux/macOS)
 │   ├── stop-backend.sh             # 后端服务一键停止 (Linux/macOS)
 │   ├── start-backend.py            # 后端服务一键启动 (跨平台)
-│   └── stop-backend.py             # 后端服务一键停止 (跨平台)
+│   ├── stop-backend.py             # 后端服务一键停止 (跨平台)
+│   ├── seed_via_mysql.py           # 数据库种子数据（官方 Agent/LLM/Skill）
+│   └── seed_initial_data.{py,ps1}  # 跨平台种子脚本
 │
 ├── frontend/                       # Vue3 前端
-│   ├── package.json                # 依赖（vue/antd/axios/marked）
+│   ├── package.json                # 依赖（vue/antd/axios/marked/mermaid）
 │   ├── vite.config.js              # Vite配置 + API代理
 │   └── src/
-│       ├── api/index.js            # API请求封装 + SSE流式处理
+│       ├── api/index.js            # API请求封装 + SSE流式处理 ★
 │       ├── router/index.js         # 路由配置（9个页面）
 │       ├── App.vue                 # 主布局（侧边栏+内容区）
+│       ├── components/
+│       │   └── MermaidBlock.vue    # (P2.1) Mermaid 图表渲染组件 ★
 │       └── views/
-│           ├── chat/               # 对话页面 ★
-│           ├── agent/              # Agent管理 ★
+│           ├── chat/               # 对话页面（SSE全事件链路 + Plan&Execute） ★
+│           ├── agent/              # Agent管理（含绑定面板 + tools-summary Drawer） ★
 │           ├── llm-config/          # LLM配置 ★
-│           ├── memory/              # 记忆查看器 ★
+│           ├── memory/              # 记忆查看器（长期/短期/摘要弹窗） ★
 │           ├── mcp/                 # (P2) MCP管理 ★
 │           ├── skill/               # (P2) Skill管理 ★
 │           ├── rag/                 # (P3) RAG管理占位
@@ -553,7 +646,7 @@ agent-service-platform/
 │   │   ├── domain/
 │   │   │   ├── base_entity.py      # DDD基类
 │   │   │   ├── models.py           # SQLAlchemy ORM模型 ★
-│   │   │   ├── llm_adapter.py      # LangChain LLM适配器 ★
+│   │   │   ├── llm_adapter.py      # LangChain LLM适配器（含 reasoning_content 回传） ★
 │   │   │   ├── mcp_adapter.py      # (P2) MCP SSE/STDIO适配器 ★
 │   │   │   └── skill_manager.py    # (P2) Skill渐进式披露管理器 ★
 │   │   └── infrastructure/
@@ -565,16 +658,16 @@ agent-service-platform/
 │   │   ├── main.py
 │   │   ├── routers/
 │   │   │   ├── llm_config.py       # LLM配置CRUD
-│   │   │   └── agent.py            # Agent CRUD+状态机
+│   │   │   └── agent.py            # Agent CRUD+状态机+绑定
 │   │   └── services/
 │   │       ├── llm_service.py      # LLM业务逻辑（加密/掩码）
-│   │       └── agent_service.py     # Agent业务逻辑（状态机/克隆/官方Agent）
+│   │       └── agent_service.py     # Agent业务逻辑（状态机/克隆/官方Agent/tools-summary）
 │   │
 │   ├── chat-svc/                   # 对话服务(:8002) ★
 │   │   ├── main.py
 │   │   ├── routers/chat.py         # 会话CRUD+SSE流式+停止生成+重新生成
 │   │   └── services/
-│   │       ├── chat_service.py     # 对话编排核心 + ReAct循环 ★
+│   │       ├── chat_service.py     # 对话编排核心：ReAct循环 + 事件分离 + 技能筛选 + 记忆评估触发 ★
 │   │       └── memory_service.py   # 记忆加载+上下文压缩
 │   │
 │   ├── tool-svc/                   # 工具服务(:8003) ★
@@ -582,16 +675,18 @@ agent-service-platform/
 │   │   ├── routers/
 │   │   │   ├── mcp.py              # (P2) MCP服务CRUD+连接管理
 │   │   │   ├── skill.py            # (P2) Skill CRUD+导入
-│   │   │   └── tool_call.py        # (P2) 工具调用代理+调用日志
+│   │   │   ├── tool_call.py        # (P2) 工具调用代理+调用日志
+│   │   │   └── oauth.py            # (P2.1) OAuth 2.0 认证流程
 │   │   └── services/
-│   │       ├── mcp_service.py      # (P2) MCP连接+工具发现
-│   │       └── skill_service.py    # (P2) Skill导入解析+渐进披露
+│   │       ├── mcp_service.py      # (P2) MCP连接+工具发现+web_search fallback
+│   │       ├── skill_service.py    # (P2) Skill导入解析+渐进披露
+│   │       └── oauth_service.py    # (P2.1) OAuth 业务逻辑
 │   │
 │   ├── mem-svc/                    # 记忆服务(:8004) ★
 │   │   ├── main.py
-│   │   ├── routers/memory.py       # 长期记忆+短期记忆+语义检索API
+│   │   ├── routers/memory.py       # 长期/短期/语义检索 + /evaluate（动态加载 LLM adapter） ★
 │   │   └── services/
-│   │       ├── memory_service.py   # 记忆CRUD+评估更新+语义检索
+│   │       ├── memory_service.py   # 记忆CRUD+评估更新+语义检索 ★
 │   │       └── short_term_cache.py # (P2) Redis缓存(TTL=24h) ★
 │   │
 │   ├── rag-svc/                    # (P3) RAG服务骨架
@@ -600,7 +695,14 @@ agent-service-platform/
 │   └── evo-svc/                    # (P4) 进化服务骨架
 │
 └── infra/
-    ├── mysql/init.sql              # 数据库初始化(20张表)
+    ├── mysql/
+    │   ├── init.sql                # 数据库初始化(20张表)
+    │   └── migrations/             # (P2.1) 迁移脚本
+    │       ├── 20260814_add_thinking_to_messages.sql          # messages 表新增 thinking 字段
+    │       ├── 20260819_add_attachments_to_messages.sql       # messages 表新增 attachments 字段
+    │       ├── 20260819_add_builtin_flag.sql                  # skills 表新增 is_builtin 标记
+    │       ├── 20260819_add_skill_success_count.sql            # skills 表新增 success_count
+    │       └── 20260819_rename_drawing_agent_to_design_mermaid.sql  # 内置 Agent 重命名
     └── nginx/default.conf          # Nginx配置
 ```
 
@@ -637,6 +739,7 @@ agent-service-platform/
 | Ant Design Vue | 4 | UI组件库 |
 | Axios | 1 | HTTP请求 |
 | marked | 12 | Markdown渲染 |
+| mermaid | 10+ | (P2.1) Mermaid 图表渲染 |
 | Vite | 5 | 构建工具 |
 
 ---
@@ -645,8 +748,9 @@ agent-service-platform/
 
 - [x] **Phase 0** — 项目初始化（8微服务骨架 + Docker环境 + 数据库脚本）
 - [x] **Phase 1** — 基础设施与Agent核心域（LLM接入 + Agent管理 + 流式对话 + 记忆管理）
-- [x] **Phase 2** — 对话与工具域（MCP双模式 + Skill管理 + ReAct）← **当前版本**
-- [ ] Phase 3 — RAG与ChatBI域（Agentic RAG + 智能问数）
+- [x] **Phase 2** — 对话与工具域（MCP双模式 + Skill管理 + ReAct）
+- [x] **Phase 2.1** — 智能化增强（长期记忆自动评估 + 流式思考/回答分离 + 技能按需筛选 + Plan-and-Execute + DeepSeek R1 兼容 + MCP fallback + Mermaid 渲染）← **当前版本**
+- [ ] Phase 3 — RAG与ChatBI域（Agentic RAG + 智能问数 + Milvus 向量检索落地）
 - [ ] Phase 4 — 协同与进化域（多Agent协作 + Hermes自我进化）
 - [ ] Phase 5 — P1增强功能
 - [ ] Phase 6 — P2远期规划
@@ -657,25 +761,26 @@ agent-service-platform/
 |------|-----|------|
 | Phase 0 | - | 项目初始化骨架 |
 | Phase 1 | **v1.0-phase1** | LLM接入+Agent管理+流式对话+记忆管理 |
-| **Phase 2** | **v2.0-phase2** | **MCP双模式+Skill渐进披露+ReAct循环+记忆深化** |
+| Phase 2 | **v2.0-phase2** | MCP双模式+Skill渐进披露+ReAct循环+记忆深化 |
+| **Phase 2.1** | **v2.1-phase2.1** | **长期记忆自动评估+流式思考/回答分离+技能按需筛选+Plan-and-Execute+DeepSeek R1+MCP fallback+Mermaid** |
 
 ---
 
 ## 数据库
 
-数据库初始化脚本位于 [infra/mysql/init.sql](infra/mysql/init.sql)，共20张表：
+数据库初始化脚本位于 [infra/mysql/init.sql](infra/mysql/init.sql)，共20张表；P2.1 迭代迁移脚本位于 [infra/mysql/migrations/](infra/mysql/migrations/)：
 
 | 表名 | 所属域 | 说明 |
 |------|--------|------|
 | llm_configs | Agent域 | LLM配置（API Key加密存储） |
-| agents | Agent域 | Agent定义（状态机/官方标记/克隆来源） |
-| long_term_memories | 记忆域 | 长期记忆（1:1关联Agent） |
+| agents | Agent域 | Agent定义（状态机/官方标记/克隆来源/workflow_mode） |
+| long_term_memories | 记忆域 | 长期记忆（1:1关联Agent，version 化） |
 | conversations | 对话域 | 会话 |
-| messages | 对话域 | 消息记录 |
+| messages | 对话域 | 消息记录（P2.1 新增 thinking / attachments 字段） |
 | mcp_services | 工具域 | (P2) MCP服务注册 |
 | mcp_tools | 工具域 | (P2) MCP工具 |
 | agent_mcp_bindings | 工具域 | (P2) Agent-MCP绑定 |
-| skills | 工具域 | (P2) Skill技能（Level0/1/2） |
+| skills | 工具域 | (P2) Skill技能（Level0/1/2，P2.1 新增 is_builtin / success_count） |
 | agent_skill_bindings | 工具域 | (P2) Agent-Skill绑定 |
 | knowledge_bases | RAG域 | (P3) 知识库 |
 | documents | RAG域 | (P3) 文档 |
@@ -689,4 +794,19 @@ agent-service-platform/
 | evolution_metrics | 进化域 | 进化指标 |
 
 > P1阶段使用前5张表（llm_configs / agents / long_term_memories / conversations / messages）。
-> P2阶段追加使用 mcp_services / mcp_tools / agent_mcp_bindings / skills / agent_skill_bindings / tool_call_logs 共6张表，其余表已建好待后续Phase使用。
+> P2阶段追加使用 mcp_services / mcp_tools / agent_mcp_bindings / skills / agent_skill_bindings / tool_call_logs 共6张表。
+> P2.1 阶段通过迁移脚本为现有表补充字段：messages 新增 thinking/attachments；skills 新增 is_builtin/success_count；并将内置"绘图助手"Agent 重命名为"软件设计图绘图助手"。
+> 其余表已建好待后续 Phase 使用。
+
+### P2.1 迁移脚本执行顺序
+
+```bash
+# 在 init.sql 执行后按时间顺序执行迁移
+mysql -u root -proot123 agent_service < infra/mysql/migrations/20260814_add_thinking_to_messages.sql
+mysql -u root -proot123 agent_service < infra/mysql/migrations/20260819_add_attachments_to_messages.sql
+mysql -u root -proot123 agent_service < infra/mysql/migrations/20260819_add_builtin_flag.sql
+mysql -u root -proot123 agent_service < infra/mysql/migrations/20260819_add_skill_success_count.sql
+mysql -u root -proot123 agent_service < infra/mysql/migrations/20260819_rename_drawing_agent_to_design_mermaid.sql
+```
+
+> 所有迁移脚本均为**幂等**设计（`IF NOT EXISTS` / `IGNORE`），可重复执行不会报错。
