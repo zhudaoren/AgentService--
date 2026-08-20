@@ -1,4 +1,6 @@
 """Pydantic 请求/响应模型"""
+from __future__ import annotations
+
 from datetime import datetime
 from typing import Any, Optional
 from pydantic import BaseModel, Field
@@ -48,11 +50,22 @@ class LLMConfigOut(BaseModel):
     api_base_url: str = ""
     default_params: dict = {}
     is_default: bool = False
+    is_builtin: bool = False
     created_at: datetime
     updated_at: datetime
 
 
-# ── Agent ──────────────────────────────────────────────
+# ── 多模态附件 ──────────────────────────────────────────
+class AttachmentIn(BaseModel):
+    """多模态附件输入（图片/音频）"""
+    type: str = Field(..., description="附件类型：image / audio")
+    mime: Optional[str] = Field(None, description="MIME 类型，如 image/png")
+    name: Optional[str] = Field(None, description="原始文件名")
+    data_url: Optional[str] = Field(None, description="Base64 Data URL（小文件优先）")
+    url: Optional[str] = Field(None, description="远程可访问 URL（与 data_url 二选一）")
+
+
+# ── 聊天消息 ──────────────────────────────────────────
 class AgentCreate(BaseModel):
     name: str = Field(..., max_length=128)
     description: str = ""
@@ -62,6 +75,10 @@ class AgentCreate(BaseModel):
     max_tokens: int = 4096
     top_p: float = 0.9
     memory_strategy: str = "standard"
+    workflow_mode: str = Field(
+        "hybrid",
+        description="默认工作模式: react(边思考边行动) / plan_and_execute(先计划后执行) / hybrid(混合模式，自适应)",
+    )
     config: dict = {}
 
 
@@ -74,6 +91,7 @@ class AgentUpdate(BaseModel):
     max_tokens: Optional[int] = None
     top_p: Optional[float] = None
     memory_strategy: Optional[str] = None
+    workflow_mode: Optional[str] = None
     config: Optional[dict] = None
 
 
@@ -91,6 +109,7 @@ class AgentOut(BaseModel):
     max_tokens: int = 4096
     top_p: float = 0.9
     memory_strategy: str = "standard"
+    workflow_mode: str = "hybrid"
     config: dict = {}
     created_at: datetime
     updated_at: datetime
@@ -110,6 +129,7 @@ class ConversationCreate(BaseModel):
 class ConversationOut(BaseModel):
     id: str
     agent_id: str
+    agent_name: str = ""
     user_id: str = ""
     title: str = ""
     status: str = "active"
@@ -123,8 +143,10 @@ class MessageOut(BaseModel):
     conversation_id: str
     message_type: str
     content: str
+    thinking: Optional[str] = None
     tool_calls: Optional[dict] = None
     tool_results: Optional[dict] = None
+    attachments: Optional[list] = None
     token_count: int = 0
     created_at: datetime
 
@@ -132,7 +154,15 @@ class MessageOut(BaseModel):
 class ChatRequest(BaseModel):
     conversation_id: str
     content: str
+    attachments: Optional[list] = Field(
+        default=None,
+        description="多模态附件列表，元素结构同 AttachmentIn (type/mime/name/data_url/url)",
+    )
     stream: bool = True
+    workflow_mode: Optional[str] = Field(
+        None,
+        description="工作模式: react(边思考边行动) / plan_and_execute(先计划后执行) / hybrid(混合模式，默认hybrid)",
+    )
 
 
 # ── 记忆 ──────────────────────────────────────────────
@@ -173,8 +203,11 @@ class MCPSTDIOConfig(BaseModel):
 class MCPServiceCreate(BaseModel):
     name: str = Field(..., max_length=128)
     description: str = ""
-    mode: str = Field(..., description="sse 或 stdio")
+    mode: str = Field(..., description="sse / streamable_http / stdio")
     sse_url: str = ""
+    auth_type: str = Field(default="none", description="认证类型: none / bearer / basic / custom / oauth")
+    headers: dict = Field(default_factory=dict, description="HTTP 请求头（远程模式认证用）")
+    oauth_config: dict = Field(default_factory=dict, description="OAuth 2.1 配置（client_id/client_secret/scopes/redirect_uri/auth_server_url）")
     stdio_config: dict = {}
     status: str = "disconnected"
 
@@ -184,6 +217,9 @@ class MCPServiceUpdate(BaseModel):
     description: Optional[str] = None
     mode: Optional[str] = None
     sse_url: Optional[str] = None
+    auth_type: Optional[str] = None
+    headers: Optional[dict] = None
+    oauth_config: Optional[dict] = None
     stdio_config: Optional[dict] = None
     status: Optional[str] = None
     error_message: Optional[str] = None
@@ -195,9 +231,15 @@ class MCPServiceOut(BaseModel):
     description: str = ""
     mode: str
     sse_url: str = ""
+    auth_type: str = "none"
+    headers: dict = {}
+    oauth_config: dict = {}
+    oauth_tokens: dict = {}
+    oauth_status: str = "not_configured"
     stdio_config: dict = {}
     status: str = "disconnected"
     error_message: str = ""
+    is_builtin: bool = False
     last_connected_at: Optional[datetime] = None
     created_at: datetime
     updated_at: datetime
@@ -299,6 +341,7 @@ class SkillOut(BaseModel):
     storage_path: str = ""
     enabled: bool = True
     usage_count: int = 0
+    success_count: int = 0
     success_rate: float = 0.0
     author: str = ""
     tags: list = []
@@ -315,7 +358,16 @@ class SkillLocalImport(BaseModel):
 
 class SkillOnlineImport(BaseModel):
     source_url: str = Field(..., max_length=512, description="在线Skill源地址")
+    import_format: str = Field(
+        "markdown",
+        description="导入格式：markdown(.md) / json(.json) / zip(.zip 多文件结构)",
+    )
     category: str = "general"
+
+
+class SkillIncrementUsage(BaseModel):
+    """Skill 使用次数+成功率计数请求（内网 chat-svc → tool-svc 可信调用）"""
+    success: bool = Field(..., description="本次 Skill 使用是否成功（无致命异常+答案非空）")
 
 
 # ── Skill 渐进式加载响应 ────────────────────────────────

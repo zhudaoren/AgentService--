@@ -38,7 +38,19 @@ request.interceptors.response.use(
     let msg = '请求失败'
     if (error.response) {
       const data = error.response.data
-      msg = data?.message || data?.detail || data?.error || `请求错误 (${error.response.status})`
+      if (typeof data?.message === 'string') {
+        msg = data.message
+      } else if (typeof data?.detail === 'string') {
+        msg = data.detail
+      } else if (Array.isArray(data?.detail)) {
+        msg = data.detail.map(d => (typeof d === 'string' ? d : d?.msg || d?.message || JSON.stringify(d))).join('; ')
+      } else if (typeof data?.detail === 'object' && data?.detail !== null) {
+        msg = data.detail.msg || data.detail.message || JSON.stringify(data.detail)
+      } else if (typeof data?.error === 'string') {
+        msg = data.error
+      } else {
+        msg = `请求错误 (${error.response.status})`
+      }
     } else if (error.request) {
       msg = '服务器无响应，请检查网络或后端服务'
     } else {
@@ -71,6 +83,8 @@ export const agentApi = {
   clone: (id) => request.post(`/agents/${id}/clone`),
   official: (params) => request.get('/agents/official/list', { params }),
   polishPrompt: (raw_prompt) => request.post('/agents/polish-prompt', { raw_prompt }),
+  polishMcpDescription: (raw_description, mode = '') =>
+    request.post('/agents/polish-mcp-description', { raw_description, mode }),
 }
 
 // ============ 会话 ============
@@ -79,7 +93,7 @@ export const conversationApi = {
   list: (params) => request.get('/conversations', { params }),
   detail: (id) => request.get(`/conversations/${id}`),
   remove: (id) => request.delete(`/conversations/${id}`),
-  messages: (id) => request.get(`/conversations/${id}/messages`),
+  messages: (id, params) => request.get(`/conversations/${id}/messages`, { params }),
 }
 
 // ============ 对话（SSE 流式） ============
@@ -107,57 +121,108 @@ export const chatApi = {
         })
 
         if (!response.ok) {
-          throw new Error(`HTTP ${response.status}`)
+          let errMsg = `HTTP ${response.status}`
+          try {
+            const body = await response.text()
+            const parsed = JSON.parse(body)
+            errMsg = parsed.detail || parsed.message || parsed.error || body
+          } catch (_) {
+            // use default message
+          }
+          throw new Error(errMsg)
         }
 
         const reader = response.body.getReader()
         const decoder = new TextDecoder('utf-8')
         let buffer = ''
+        let streamError = null
+        let currentEvent = ''
+        let eventDataLines = []
+
+        const flushEvent = () => {
+          if (eventDataLines.length === 0) return
+          const jsonStr = eventDataLines.join('\n')
+          eventDataLines = []
+          try {
+            if (jsonStr === '[DONE]') {
+              onDone && onDone({ error: streamError })
+              return
+            }
+            const data = JSON.parse(jsonStr)
+            // 将 SSE event 类型注入 data，供上层 handler 识别
+            if (typeof data === 'object' && data !== null) {
+              data._event = currentEvent
+              // 兼容：同时设置 type 字段，便于上层判断
+              if (!data.type) data.type = currentEvent
+            }
+            if (currentEvent === 'done') {
+              onDone && onDone({ ...data, error: streamError })
+              return
+            }
+            if (data.error) {
+              streamError = data.error
+              onMessage && onMessage(data)
+              return
+            }
+            if (data.done) {
+              onDone && onDone({ ...data, error: streamError })
+              return
+            }
+            onMessage && onMessage(data)
+          } catch (e) {
+            // ignore parse errors
+          }
+          currentEvent = ''
+        }
 
         while (true) {
           const { done, value } = await reader.read()
           if (done) break
           buffer += decoder.decode(value, { stream: true })
-          // SSE 以 \n\n 分隔事件，按行处理
-          const parts = buffer.split('\n')
-          buffer = parts.pop() // 保留最后不完整的行
-          for (const line of parts) {
+          const lines = buffer.split('\n')
+          buffer = lines.pop()
+          for (const line of lines) {
             const trimmed = line.trim()
-            if (!trimmed || !trimmed.startsWith('data:')) continue
-            const jsonStr = trimmed.replace(/^data:\s*/, '')
-            if (jsonStr === '[DONE]') {
-              onDone && onDone({})
-              return
+            if (!trimmed) {
+              flushEvent()
+              continue
             }
-            try {
-              const data = JSON.parse(jsonStr)
-              if (data.done) {
-                onDone && onDone(data)
-                return
-              }
-              if (data.content) {
-                onMessage && onMessage(data)
-              }
-            } catch (e) {
-              // 忽略解析错误的行
+            if (trimmed.startsWith('event:')) {
+              currentEvent = trimmed.replace(/^event:\s*/, '')
+              continue
+            }
+            if (trimmed.startsWith('data:')) {
+              eventDataLines.push(trimmed.replace(/^data:\s*/, ''))
             }
           }
         }
-        // 处理 buffer 中剩余数据
-        if (buffer.startsWith('data:')) {
+        // Process remaining buffer content
+        if (buffer.trim()) {
+          const trimmed = buffer.trim()
+          if (trimmed.startsWith('event:')) {
+            currentEvent = trimmed.replace(/^event:\s*/, '')
+          } else if (trimmed.startsWith('data:')) {
+            eventDataLines.push(trimmed.replace(/^data:\s*/, ''))
+          }
+        }
+        flushEvent()
+        if (eventDataLines.length > 0) {
+          const jsonStr = eventDataLines.join('\n')
           try {
-            const data = JSON.parse(buffer.replace(/^data:\s*/, ''))
-            if (data.done) {
-              onDone && onDone(data)
-            } else if (data.content) {
+            const data = JSON.parse(jsonStr)
+            if (currentEvent === 'done' || data.done) {
+              onDone && onDone({ ...data, error: streamError })
+            } else {
               onMessage && onMessage(data)
             }
-          } catch (e) {}
+          } catch (e) {
+            onDone && onDone({ error: streamError })
+          }
+        } else {
+          onDone && onDone({ error: streamError })
         }
-        onDone && onDone({})
       } catch (err) {
         if (err.name === 'AbortError') {
-          // 主动中断，不计为错误
           onDone && onDone({ aborted: true })
           return
         }
@@ -196,6 +261,13 @@ export const mcpApi = {
       `/mcp-services/${encodeURIComponent(id)}/tools/${encodeURIComponent(toolName)}/toggle`,
       { enabled }
     ),
+  // OAuth 2.1 接口
+  oauthDiscover: (id) => request.post(`/mcp-services/${encodeURIComponent(id)}/oauth/discover`),
+  oauthConfig: (id, data) => request.post(`/mcp-services/${encodeURIComponent(id)}/oauth/config`, data),
+  oauthAuthorize: (id, data) => request.post(`/mcp-services/${encodeURIComponent(id)}/oauth/authorize`, data),
+  oauthRefresh: (id) => request.post(`/mcp-services/${encodeURIComponent(id)}/oauth/refresh`),
+  oauthRevoke: (id) => request.post(`/mcp-services/${encodeURIComponent(id)}/oauth/revoke`),
+  oauthStatus: (id) => request.get(`/mcp-services/${encodeURIComponent(id)}/oauth/status`),
 }
 
 // ============ 工具调用 ============
@@ -218,7 +290,12 @@ export const skillApi = {
     request.post('/skills/import/local', formData, {
       headers: { 'Content-Type': 'multipart/form-data' },
     }),
-  importOnline: (data) => request.post('/skills/import/online', data),
+  importOnline: (opts = {}) =>
+    request.post('/skills/import/online', {
+      source_url: opts.source_url,
+      import_format: opts.import_format || 'markdown',
+      category: opts.category || 'general',
+    }),
   progressive: (id, level) =>
     request.get(`/skills/${encodeURIComponent(id)}/progressive`, { params: { level } }),
 }
@@ -262,50 +339,104 @@ chatApi.regenerate = (payload, handlers = {}) => {
       })
 
       if (!response.ok) {
-        throw new Error(`HTTP ${response.status}`)
+        let errMsg = `HTTP ${response.status}`
+        try {
+          const body = await response.text()
+          const parsed = JSON.parse(body)
+          errMsg = parsed.detail || parsed.message || parsed.error || body
+        } catch (_) {}
+        throw new Error(errMsg)
       }
 
       const reader = response.body.getReader()
       const decoder = new TextDecoder('utf-8')
       let buffer = ''
+      let streamError = null
+      let currentEvent = ''
+      let eventDataLines = []
+
+      const flushEvent = () => {
+        if (eventDataLines.length === 0) return
+        const jsonStr = eventDataLines.join('\n')
+        eventDataLines = []
+        try {
+          if (jsonStr === '[DONE]') {
+            onDone && onDone({ error: streamError })
+            return
+          }
+          const data = JSON.parse(jsonStr)
+          // 将 SSE event 类型注入 data，供上层 handler 识别（与 sendStream 保持一致）
+          if (typeof data === 'object' && data !== null) {
+            data._event = currentEvent
+            // 兼容：同时设置 type 字段，便于上层判断
+            if (!data.type) data.type = currentEvent
+          }
+          if (currentEvent === 'done') {
+            onDone && onDone({ ...data, error: streamError })
+            return
+          }
+          if (data.error) {
+            streamError = data.error
+            onMessage && onMessage(data)
+            return
+          }
+          if (data.done) {
+            onDone && onDone({ ...data, error: streamError })
+            return
+          }
+          onMessage && onMessage(data)
+        } catch (e) {
+          // ignore parse errors
+        }
+        currentEvent = ''
+      }
 
       while (true) {
         const { done, value } = await reader.read()
         if (done) break
         buffer += decoder.decode(value, { stream: true })
-        const parts = buffer.split('\n')
-        buffer = parts.pop()
-        for (const line of parts) {
+        const lines = buffer.split('\n')
+        buffer = lines.pop()
+        for (const line of lines) {
           const trimmed = line.trim()
-          if (!trimmed || !trimmed.startsWith('data:')) continue
-          const jsonStr = trimmed.replace(/^data:\s*/, '')
-          if (jsonStr === '[DONE]') {
-            onDone && onDone({})
-            return
+          if (!trimmed) {
+            flushEvent()
+            continue
           }
-          try {
-            const data = JSON.parse(jsonStr)
-            if (data.done) {
-              onDone && onDone(data)
-              return
-            }
-            if (data.content || data.type) {
-              onMessage && onMessage(data)
-            }
-          } catch (e) {}
+          if (trimmed.startsWith('event:')) {
+            currentEvent = trimmed.replace(/^event:\s*/, '')
+            continue
+          }
+          if (trimmed.startsWith('data:')) {
+            eventDataLines.push(trimmed.replace(/^data:\s*/, ''))
+          }
         }
       }
-      if (buffer.startsWith('data:')) {
+      // Process remaining buffer content
+      if (buffer.trim()) {
+        const trimmed = buffer.trim()
+        if (trimmed.startsWith('event:')) {
+          currentEvent = trimmed.replace(/^event:\s*/, '')
+        } else if (trimmed.startsWith('data:')) {
+          eventDataLines.push(trimmed.replace(/^data:\s*/, ''))
+        }
+      }
+      flushEvent()
+      if (eventDataLines.length > 0) {
+        const jsonStr = eventDataLines.join('\n')
         try {
-          const data = JSON.parse(buffer.replace(/^data:\s*/, ''))
-          if (data.done) {
-            onDone && onDone(data)
-          } else if (data.content || data.type) {
+          const data = JSON.parse(jsonStr)
+          if (currentEvent === 'done' || data.done) {
+            onDone && onDone({ ...data, error: streamError })
+          } else {
             onMessage && onMessage(data)
           }
-        } catch (e) {}
+        } catch (e) {
+          onDone && onDone({ error: streamError })
+        }
+      } else {
+        onDone && onDone({ error: streamError })
       }
-      onDone && onDone({})
     } catch (err) {
       if (err.name === 'AbortError') {
         onDone && onDone({ aborted: true })

@@ -129,6 +129,7 @@ CREATE TABLE mcp_services (
     status        ENUM('disconnected','connecting','connected','error')
                   DEFAULT 'disconnected' COMMENT '连接状态',
     error_message TEXT COMMENT '错误信息',
+    last_connected_at DATETIME NULL COMMENT '最后连接时间',
     created_at    DATETIME DEFAULT CURRENT_TIMESTAMP,
     updated_at    DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     INDEX idx_status (status),

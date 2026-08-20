@@ -8,8 +8,11 @@ from typing import Any, Optional
 
 from fastapi import APIRouter, Body, Depends, Query
 from pydantic import BaseModel, Field
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
+from common.logger import get_logger
 from common.schemas import (
     ApiResponse,
     LongTermMemoryOut,
@@ -20,6 +23,7 @@ from infrastructure.db import get_db
 from services.memory_service import memory_service
 from services.short_term_cache import short_term_cache
 
+logger = get_logger(__name__)
 memory_router = APIRouter()
 
 
@@ -127,15 +131,46 @@ async def evaluate_memory(
     payload: MemoryEvaluateRequest,
     db: AsyncSession = Depends(get_db),
 ):
-    """对话历史记忆深化评估 -> 判断是否有值得持久化的信息并更新长期记忆
+    """对话历史记忆深化评估 -> 判断是否有值得持久化的信息并更新长期记忆。
 
-    当前 P2 阶段: llm_adapter 未注入，会直接返回 skipped=True
+    自动加载 Agent 的 LLM 配置创建 adapter（若可用），
+    若加载失败则回退为 skipped 模式。
     """
+    llm_adapter = None
+    try:
+        # 尝试加载 Agent 的 LLM 配置
+        from domain.models import Agent, LLMConfig
+        from domain.llm_adapter import LLMAdapter, create_llm_from_config
+        from common.utils.crypto import crypto_service
+        from sqlalchemy import select
+
+        agent_result = await db.execute(
+            select(Agent)
+            .where(Agent.id == payload.agent_id)
+            .options(selectinload(Agent.llm_config))
+        )
+        agent = agent_result.scalar_one_or_none()
+        if agent and agent.llm_config:
+            llm_config = agent.llm_config
+            config_dict = {
+                "provider": llm_config.provider,
+                "model_name": llm_config.model_name,
+                "api_key": crypto_service.decrypt(llm_config.api_key) if llm_config.api_key else "",
+                "api_base_url": llm_config.api_base_url or "",
+                "default_params": llm_config.default_params or {},
+            }
+            llm_adapter = await create_llm_from_config(config_dict)
+            logger.info(f"[Memory] 已加载 LLM adapter for agent {payload.agent_id}")
+        else:
+            logger.warning(f"[Memory] Agent {payload.agent_id} 无 LLM 配置，跳过记忆评估")
+    except Exception as e:
+        logger.warning(f"[Memory] 加载 LLM adapter 失败: {e}")
+
     result = await memory_service.evaluate_and_update_long_term(
         db=db,
         agent_id=payload.agent_id,
         conversation_messages=payload.messages or [],
-        llm_adapter=None,
+        llm_adapter=llm_adapter,
     )
     # 如果传了 conversation_id，best-effort 同步刷新短期缓存
     if payload.conversation_id and (payload.messages or []):

@@ -3,8 +3,6 @@
 # 版本: v3.0 (Phase 2)
 # ============================================================
 
-version: "3.8"
-
 services:
 
   # ============================================================
@@ -27,7 +25,7 @@ services:
     networks:
       - agent-net
     healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-p${MYSQL_ROOT_PASSWORD:-root123}"]
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-p${MYSQL_ROOT_PASSWORD:-root}"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -37,19 +35,26 @@ services:
     container_name: agent-redis
     ports:
       - "6379:6379"
-    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:-}
+    command: >
+      sh -c 'if [ -n "$REDIS_PASSWORD" ]; then
+               exec redis-server --appendonly yes --requirepass "$REDIS_PASSWORD";
+             else
+               exec redis-server --appendonly yes;
+             fi'
+    environment:
+      - REDIS_PASSWORD=${REDIS_PASSWORD:-}
     volumes:
       - redis-data:/data
     networks:
       - agent-net
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD-SHELL", "redis-cli ping 2>/dev/null || redis-cli -a \"$REDIS_PASSWORD\" ping 2>/dev/null || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 5
 
   minio:
-    image: minio/minio:RELEASE.2024-01-01T00-00-00Z
+    image: minio/minio:RELEASE.2024-10-13T13-34-11Z
     container_name: agent-minio
     ports:
       - "9000:9000"

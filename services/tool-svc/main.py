@@ -26,6 +26,7 @@ from infrastructure.db import init_db
 from routers.mcp import mcp_router
 from routers.skill import skill_router
 from routers.tool_call import tool_call_router
+from routers.oauth import oauth_router
 from services.skill_service import skill_import_service
 
 logger = get_logger("tool-svc")
@@ -96,6 +97,7 @@ async def health_check():
 app.include_router(mcp_router, prefix="/api/v1", tags=["MCP管理"])
 app.include_router(skill_router, prefix="/api/v1", tags=["Skill管理"])
 app.include_router(tool_call_router, prefix="/api/v1", tags=["工具调用"])
+app.include_router(oauth_router, prefix="/api/v1", tags=["OAuth授权"])
 
 
 if __name__ == "__main__":

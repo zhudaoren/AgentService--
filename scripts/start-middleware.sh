@@ -24,7 +24,7 @@ NC='\033[0m'
 MIDDLEWARE_SERVICES=(
     "mysql:8.0|agent-mysql|3306"
     "redis:7-alpine|agent-redis|6379"
-    "minio/minio:RELEASE.2024-01-01T00-00-00Z|agent-minio|9000"
+    "minio/minio:RELEASE.2024-10-13T13-34-11Z|agent-minio|9000"
     "quay.io/coreos/etcd:v3.5.5|agent-milvus-etcd|-"
     "minio/minio:RELEASE.2023-03-20T20-16-18Z|agent-milvus-minio|-"
     "milvusdb/milvus:v2.4.0|agent-milvus|19530"
@@ -106,6 +106,15 @@ if [[ ! -f "$PROJECT_ROOT/.env" ]]; then
     echo -e "${GREEN}✓ 已从 .env.example 创建 .env${NC}"
     echo ""
 fi
+
+# 加载 .env 变量（忽略注释和空行）
+set -a
+source <(grep -v '^\s*#' "$PROJECT_ROOT/.env" | grep -v '^\s*$' | sed 's/^\s*//' | sed 's/\s*$//')
+set +a
+
+# 默认值兜底
+MYSQL_ROOT_PASSWORD="${MYSQL_ROOT_PASSWORD:-root123}"
+REDIS_PASSWORD="${REDIS_PASSWORD:-}"
 
 # ── 3. 列出镜像清单 ────────────────────────────────────
 
@@ -206,8 +215,10 @@ echo ""
 
 # 等待 MySQL
 echo -n "  MySQL (3306) "
+MYSQL_PWD_ARG=""
+[[ -n "$MYSQL_ROOT_PASSWORD" ]] && MYSQL_PWD_ARG="-p${MYSQL_ROOT_PASSWORD}"
 for i in $(seq 1 30); do
-    if docker exec agent-mysql mysqladmin ping -h localhost -uroot -proot123 &>/dev/null 2>&1; then
+    if docker exec agent-mysql mysqladmin ping -h localhost -uroot $MYSQL_PWD_ARG &>/dev/null 2>&1; then
         echo -e "${GREEN}✓${NC}"
         break
     fi
@@ -220,8 +231,10 @@ done
 
 # 等待 Redis
 echo -n "  Redis (6379) "
+REDIS_AUTH_ARG=""
+[[ -n "$REDIS_PASSWORD" ]] && REDIS_AUTH_ARG="-a ${REDIS_PASSWORD}"
 for i in $(seq 1 15); do
-    if docker exec agent-redis redis-cli ping &>/dev/null 2>&1; then
+    if docker exec agent-redis redis-cli $REDIS_AUTH_ARG ping &>/dev/null 2>&1; then
         echo -e "${GREEN}✓${NC}"
         break
     fi
@@ -271,8 +284,12 @@ echo ""
 $COMPOSE_CMD ps $COMPOSE_MIDDLEWARE 2>/dev/null | sed 's/^/  /'
 echo ""
 echo "  服务地址:"
-echo "    MySQL:          localhost:3306  (root/root123)"
-echo "    Redis:          localhost:6379  (无密码)"
+echo "    MySQL:          localhost:3306  (root/${MYSQL_ROOT_PASSWORD})"
+if [[ -n "$REDIS_PASSWORD" ]]; then
+    echo "    Redis:          localhost:6379  (有密码)"
+else
+    echo "    Redis:          localhost:6379  (无密码)"
+fi
 echo "    MinIO API:      http://localhost:9000  (minioadmin/minioadmin)"
 echo "    MinIO Console:  http://localhost:9001  (minioadmin/minioadmin)"
 echo "    Milvus:         localhost:19530"

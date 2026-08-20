@@ -256,19 +256,19 @@
     >
       <div class="import-tip">
         <info-circle-outlined />
-        支持格式：<span class="text-mono">.md</span> / <span class="text-mono">.skill</span> / <span class="text-mono">.json</span>
+        支持格式：<span class="text-mono">.md</span> / <span class="text-mono">.skill</span> / <span class="text-mono">.json</span> / <span class="text-mono">.zip</span>（多文件结构包）
       </div>
       <a-upload-dragger
         v-model:file-list="importLocalFileList"
         :before-upload="() => false"
         :max-count="1"
-        accept=".md,.skill,.json"
+        accept=".md,.skill,.json,.txt,.zip"
       >
         <p class="ant-upload-drag-icon">
           <inbox-outlined />
         </p>
         <p class="ant-upload-text">点击或拖拽文件到此处上传</p>
-        <p class="ant-upload-hint">单个文件，导入后将自动解析生成 3 级 Level 内容</p>
+        <p class="ant-upload-hint">支持 .md/.json/.skill/.txt 单文件，或 .zip 多文件结构包（含 SKILL.md + scripts/references/assets）</p>
       </a-upload-dragger>
     </a-modal>
 
@@ -295,6 +295,7 @@
           <a-radio-group v-model:value="importOnlineForm.import_format">
             <a-radio-button value="markdown">Markdown (.md)</a-radio-button>
             <a-radio-button value="json">JSON (.json)</a-radio-button>
+            <a-radio-button value="zip">ZIP (多文件结构 .zip)</a-radio-button>
           </a-radio-group>
         </a-form-item>
       </a-form>

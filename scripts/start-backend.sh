@@ -12,6 +12,10 @@ PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 LOG_DIR="$PROJECT_ROOT/logs"
 DAEMON_MODE=false
 
+# Conda 虚拟环境 Python 路径（可通过环境变量 AGENT_SERVICE_PYTHON 覆盖）
+CONDA_ENV_NAME="AgentService"
+PYTHON_BIN="${AGENT_SERVICE_PYTHON:-$HOME/.conda/envs/$CONDA_ENV_NAME/bin/python}"
+
 # 解析参数
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -73,10 +77,20 @@ check_port() {
 
 # 检查 Python 依赖
 check_python_deps() {
+    echo -e "${BLUE}▶ 使用 Python: $PYTHON_BIN${NC}"
+
+    # 验证 Python 可执行文件存在
+    if [[ ! -x "$PYTHON_BIN" ]]; then
+        echo -e "${RED}✗ Python 可执行文件不存在: $PYTHON_BIN${NC}"
+        echo ""
+        echo "请确认 conda 环境 '$CONDA_ENV_NAME' 已创建，或通过环境变量 AGENT_SERVICE_PYTHON 指定路径"
+        exit 1
+    fi
+
     echo -e "${BLUE}▶ 检查 Python 依赖...${NC}"
     local missing=()
     for pkg in fastapi uvicorn sqlalchemy aiomysql pydantic pydantic_settings redis cryptography httpx aiohttp minio pymilvus python_multipart; do
-        if ! python3 -c "import $pkg" 2>/dev/null; then
+        if ! "$PYTHON_BIN" -c "import $pkg" 2>/dev/null; then
             missing+=("$pkg")
         fi
     done
@@ -84,8 +98,8 @@ check_python_deps() {
         echo -e "${RED}✗ 缺少以下 Python 依赖:${NC}"
         printf '  - %s\n' "${missing[@]}"
         echo ""
-        echo "请安装依赖:"
-        echo "  pip install fastapi uvicorn 'sqlalchemy[asyncio]' aiomysql pydantic pydantic-settings redis cryptography httpx aiohttp minio pymilvus python-multipart"
+        echo "请在 '$CONDA_ENV_NAME' 环境中安装依赖:"
+        echo "  $PYTHON_BIN -m pip install -r requirements.txt"
         exit 1
     fi
     echo -e "${GREEN}✓ Python 依赖检查通过${NC}"
@@ -134,7 +148,7 @@ start_service() {
     export PYTHONPATH="$PROJECT_ROOT/services/shared:."
 
     if $DAEMON_MODE; then
-        nohup python3 -m uvicorn main:app \
+        nohup "$PYTHON_BIN" -m uvicorn main:app \
             --host 0.0.0.0 \
             --port $port \
             > "$log_file" 2>&1 &
@@ -142,7 +156,7 @@ start_service() {
         echo "  日志: $log_file | PID: $(cat "$pid_file")"
     else
         # 前台运行，输出重定向到日志同时 tee 到控制台
-        python3 -m uvicorn main:app \
+        "$PYTHON_BIN" -m uvicorn main:app \
             --host 0.0.0.0 \
             --port $port \
             2>&1 | tee "$log_file" &

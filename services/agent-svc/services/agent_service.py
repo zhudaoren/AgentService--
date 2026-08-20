@@ -11,6 +11,8 @@
   - clone_agent: 复制配置, cloned_from_id 记录来源, is_official=False
   - init_official_agents: 启动时检查并创建 5 个官方 Agent (编程/绘图/文档/RAG/ChatBI)
 """
+from __future__ import annotations
+
 import uuid
 from typing import Any, Optional
 
@@ -65,11 +67,30 @@ OFFICIAL_AGENTS: list[dict[str, Any]] = [
         "config": {"category": "programming", "icon": "code"},
     },
     {
-        "name": "绘图助手",
-        "description": "官方绘图助手 - 图像生成、设计建议",
+        "name": "软件设计图绘图助手",
+        "description": "官方软件设计图绘图助手 - 使用 Mermaid 语法绘制架构图/流程图/时序图/类图/状态图等软件设计图",
         "system_prompt": (
-            "你是一个专业的绘图助手，能够帮助用户生成图像描述、"
-            "提供设计建议、创建视觉创意方案，并指导图像生成的提示词编写。"
+            "你是【软件设计图绘图助手】，专精于使用 Mermaid 语法绘制各类软件设计图（流程图、时序图、架构图、类图、状态图、ER 图、甘特图、饼图、Git 图等）。\n\n"
+            "核心输出规范（必须严格遵守）：\n"
+            "1. 所有需要表达结构、流程、关系、状态的内容，全部使用 Mermaid 代码块输出，格式为：\n"
+            "   ```mermaid\n"
+            "   flowchart TD\n"
+            "   A[用户输入] --> B{Mermaid渲染}\n"
+            "   B --> C[SVG 图形]\n"
+            "   ```\n"
+            "2. Mermaid 代码块之前，用 1~2 句话简要说明图要表达的内容（例如：\"下面是该系统的登录时序图\"）。\n"
+            "3. Mermaid 代码块之后，用文字辅助说明图中关键节点/边的含义（如果图复杂）。\n"
+            "4. 优先选择最合适的图类型：\n"
+            "   - 业务流程/控制流 → flowchart TD / LR\n"
+            "   - 组件交互 / API 调用 → sequenceDiagram\n"
+            "   - 面向对象结构 → classDiagram\n"
+            "   - 数据模型 → erDiagram\n"
+            "   - 状态机 → stateDiagram-v2\n"
+            "   - 项目排期 → gantt\n"
+            "   - 系统部署 / 网络拓扑 → flowchart + 子图 subgraph\n"
+            "5. Mermaid 语法必须合法、可渲染，不要使用脚本或不安全语法。\n"
+            "6. 一次回答可以包含 1~3 个 Mermaid 图来分层次展示（如先流程图、再时序图），但不要输出冗余。\n\n"
+            "最后：当用户的请求含糊时，先向用户确认要绘制的图类型和主体，再输出 Mermaid 图和说明。"
         ),
         "memory_strategy": "standard",
         "config": {"category": "drawing", "icon": "image"},
@@ -159,6 +180,7 @@ class AgentService:
             max_tokens=payload.max_tokens,
             top_p=payload.top_p,
             memory_strategy=payload.memory_strategy,
+            workflow_mode=getattr(payload, "workflow_mode", "hybrid") or "hybrid",
             config=payload.config or {},
         )
         db.add(agent)
@@ -308,6 +330,7 @@ class AgentService:
             max_tokens=source.max_tokens,
             top_p=source.top_p,
             memory_strategy=source.memory_strategy,
+            workflow_mode=getattr(source, "workflow_mode", "hybrid") or "hybrid",
             config=source.config,
         )
         db.add(cloned)
@@ -353,7 +376,11 @@ class AgentService:
 
         查找 config 中标记了 is_prompt_polisher 的官方 Agent，
         使用其 LLM 配置调用大模型进行润色。
+        若 polisher 的 LLM 配置无效（无 API key），则降级使用系统默认 LLM 配置。
         """
+        from domain.llm_adapter import create_llm_from_config
+        from common.utils.crypto import crypto_service
+
         # 查找提示词工程专家 Agent
         result = await db.execute(
             select(Agent)
@@ -373,20 +400,60 @@ class AgentService:
         if not polisher.llm_config:
             raise ValidationException("提示词工程专家 Agent 未关联 LLM 配置")
 
-        # 构建 LLM 配置并调用
-        from domain.llm_adapter import create_llm_from_config
-        from common.utils.crypto import crypto_service
-
+        # 检查 polisher 的 LLM 配置是否有效
         cfg = polisher.llm_config
-        config_dict = {
-            "provider": cfg.provider,
-            "model_name": cfg.model_name,
-            "api_key": cfg.api_key or "",
-            "api_base_url": cfg.api_base_url or "",
-            "temperature": 0.3,  # 低温度保证输出稳定
-            "max_tokens": 2048,
-            "top_p": 0.9,
-        }
+        has_valid_api_key = bool(cfg.api_key)
+        
+        if not has_valid_api_key:
+            logger.warning(
+                f"提示词工程专家 Agent 的 LLM 配置无效 (id={cfg.id}), "
+                f"尝试使用系统默认 LLM 配置降级"
+            )
+            # 查找系统默认 LLM 配置
+            default_cfg_result = await db.execute(
+                select(LLMConfig)
+                .where(LLMConfig.is_default == True)
+                .limit(1)
+            )
+            default_cfg = default_cfg_result.scalar_one_or_none()
+            
+            if not default_cfg:
+                # 没有默认配置，尝试使用第一个有效配置
+                any_cfg_result = await db.execute(
+                    select(LLMConfig)
+                    .where(LLMConfig.api_key.isnot(None))
+                    .limit(1)
+                )
+                default_cfg = any_cfg_result.scalar_one_or_none()
+            
+            if not default_cfg:
+                raise ValidationException("系统中无有效的 LLM 配置可用于润色")
+            
+            logger.info(f"使用默认 LLM 配置降级: {default_cfg.name}")
+            cfg = default_cfg
+            # 使用默认配置的模型，但保留 polisher 的 system prompt
+            config_dict = {
+                "provider": cfg.provider,
+                "model_name": cfg.model_name,
+                "api_key": cfg.api_key or "",
+                "api_base_url": cfg.api_base_url or "",
+                "temperature": 0.3,
+                "max_tokens": 2048,
+                "top_p": 0.9,
+            }
+            fallback_used = True
+        else:
+            config_dict = {
+                "provider": cfg.provider,
+                "model_name": cfg.model_name,
+                "api_key": cfg.api_key or "",
+                "api_base_url": cfg.api_base_url or "",
+                "temperature": 0.3,
+                "max_tokens": 2048,
+                "top_p": 0.9,
+            }
+            fallback_used = False
+
         adapter = await create_llm_from_config(
             config_dict, decrypt_fn=crypto_service.decrypt
         )
@@ -395,15 +462,101 @@ class AgentService:
             {"role": "system", "content": polisher.system_prompt},
             {"role": "user", "content": f"请润色以下系统提示词草案：\n\n{raw_prompt}"},
         ]
-        polished = await adapter.invoke(messages)
-        logger.info(
-            f"提示词润色完成: polisher_agent={polisher.id}, "
-            f"raw_len={len(raw_prompt)}, polished_len={len(polished)}"
+        try:
+            polished = await adapter.invoke(messages)
+            logger.info(
+                f"提示词润色完成: polisher_agent={polisher.id}, "
+                f"raw_len={len(raw_prompt)}, polished_len={len(polished)}, "
+                f"fallback={fallback_used}"
+            )
+            return {
+                "polished_prompt": polished.strip(),
+                "fallback": fallback_used or adapter.is_fallback_used,
+            }
+        except Exception as e:
+            logger.error(f"提示词润色失败: {e}")
+            raise ValidationException(f"提示词润色失败: {str(e)}")
+
+    async def polish_mcp_description(
+        self, db: AsyncSession, raw_description: str, mode: str = ""
+    ) -> dict[str, Any]:
+        """使用 AI 润色 MCP 服务描述，生成专业、规范的描述文本"""
+        from domain.llm_adapter import create_llm_from_config
+        from common.utils.crypto import crypto_service
+
+        # 查找系统默认 LLM 配置
+        default_cfg_result = await db.execute(
+            select(LLMConfig)
+            .where(LLMConfig.is_default == True)
+            .limit(1)
         )
-        return {
-            "polished_prompt": polished.strip(),
-            "fallback": adapter.is_fallback_used,
+        default_cfg = default_cfg_result.scalar_one_or_none()
+        
+        if not default_cfg:
+            # 没有默认配置，尝试使用第一个有效配置
+            any_cfg_result = await db.execute(
+                select(LLMConfig)
+                .where(LLMConfig.api_key.isnot(None))
+                .limit(1)
+            )
+            default_cfg = any_cfg_result.scalar_one_or_none()
+        
+        if not default_cfg:
+            raise ValidationException("系统中无有效的 LLM 配置可用于润色")
+
+        cfg = default_cfg
+        config_dict = {
+            "provider": cfg.provider,
+            "model_name": cfg.model_name,
+            "api_key": cfg.api_key or "",
+            "api_base_url": cfg.api_base_url or "",
+            "temperature": 0.3,
+            "max_tokens": 1024,
+            "top_p": 0.9,
         }
+        adapter = await create_llm_from_config(
+            config_dict, decrypt_fn=crypto_service.decrypt
+        )
+
+        # MCP 描述润色的系统提示词
+        mcp_polish_system_prompt = """你是一个 MCP (Model Context Protocol) 服务描述专家。
+你的任务是将用户提供的简单 MCP 服务描述，润色成专业、规范、清晰的描述文本。
+
+润色原则：
+1. 简洁明确：用一句话清晰说明 MCP 服务的核心功能和用途
+2. 技术规范：使用准确的技术术语，符合 MCP 生态的描述规范
+3. 实用性：说明适用场景和典型用例
+4. 简洁有力：控制在 50-100 字以内，避免冗余
+
+输出要求：
+- 只输出润色后的描述文本，不要添加解释说明
+- 保持原描述的核心意图，不要添加不存在的功能
+- 使用中文输出"""
+
+        mode_desc = ""
+        if mode == "streamable_http":
+            mode_desc = "（基于 HTTP 的流式传输模式）"
+        elif mode == "sse":
+            mode_desc = "（SSE 传统模式）"
+        elif mode == "stdio":
+            mode_desc = "（STDIO 本地子进程模式）"
+
+        messages = [
+            {"role": "system", "content": mcp_polish_system_prompt},
+            {"role": "user", "content": f"请将以下 MCP 服务描述{mode_desc}润色为专业版本：\n\n{raw_description}"},
+        ]
+        try:
+            polished = await adapter.invoke(messages)
+            logger.info(
+                f"MCP描述润色完成: raw_len={len(raw_description)}, polished_len={len(polished)}"
+            )
+            return {
+                "polished_description": polished.strip(),
+                "fallback": adapter.is_fallback_used,
+            }
+        except Exception as e:
+            logger.error(f"MCP描述润色失败: {e}")
+            raise ValidationException(f"MCP描述润色失败: {str(e)}")
 
     async def init_official_agents(self) -> None:
         """启动时检查并创建 5 个官方 Agent (只在表为空时创建)
@@ -494,6 +647,7 @@ class AgentService:
                 max_tokens=4096,
                 top_p=0.9,
                 memory_strategy=agent_def["memory_strategy"],
+                workflow_mode=agent_def.get("workflow_mode", "hybrid") or "hybrid",
                 config=agent_def["config"],
             )
             db.add(agent)
@@ -551,6 +705,7 @@ class AgentService:
             max_tokens=agent.max_tokens,
             top_p=agent.top_p,
             memory_strategy=agent.memory_strategy,
+            workflow_mode=getattr(agent, "workflow_mode", "hybrid") or "hybrid",
             config=agent.config or {},
             created_at=agent.created_at,
             updated_at=agent.updated_at,
@@ -814,7 +969,6 @@ class AgentService:
             .join(Skill, AgentSkillBinding.skill_id == Skill.id)
             .where(
                 AgentSkillBinding.agent_id == agent_id,
-                AgentSkillBinding.enabled == True,  # noqa: E712
                 Skill.enabled == True,  # noqa: E712
             )
             .order_by(AgentSkillBinding.priority.desc())

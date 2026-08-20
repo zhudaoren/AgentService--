@@ -37,3 +37,29 @@ mysql_data/
 redis_data/
 minio_data/
 milvus_data/
+
+# Temp debug scripts (one-shot / throwaway)
+local_logic_tests.py
+check_db_schema.py
+db_schema_output.txt
+debug-tool-call-fail.md
+scripts/q.py
+scripts/_health_check.py
+scripts/_validate_stream_separation.py
+scripts/check_db.py
+scripts/fix_agent_status.py
+scripts/fix_db_keys.py
+scripts/fix_db_v2.py
+scripts/kill_backend.py
+test_e2e.py
+test_skill_zip_import.py
+test_travel.py
+test_workflow_and_thinking_fix.py
+_test_skill_filter*.py
+
+# Trae IDE
+.trae/
+
+# Trae browser screenshots
+trae-browser-screenshots/
+

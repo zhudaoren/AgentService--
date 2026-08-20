@@ -3,8 +3,10 @@
 所有响应用 ApiResponse 包装。
 路径顺序: /conversations 列表 / /chat / /chat/stop 必须在 /conversations/{conv_id} 之前。
 """
+from typing import Optional
 from fastapi import APIRouter, Depends, Query
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from common.schemas import (
@@ -20,6 +22,10 @@ from infrastructure.db import get_db
 from services.chat_service import chat_service
 
 chat_router = APIRouter()
+
+
+class RegenerateRequest(BaseModel):
+    conversation_id: str
 
 
 # ── 会话 CRUD ────────────────────────────────────────
@@ -101,6 +107,20 @@ async def get_messages(
 
 
 # ── (P2) 重新生成最后一条消息 ─────────────────────────
+@chat_router.post("/chat/regenerate")
+async def chat_regenerate(payload: RegenerateRequest):
+    """兼容前端调用：/chat/regenerate（从 body 取 conversation_id）"""
+    return StreamingResponse(
+        chat_service.regenerate_last_message(payload.conversation_id),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 @chat_router.post("/conversations/{conv_id}/regenerate")
 async def regenerate_last_message(conv_id: str):
     """重新生成最后一条 assistant 消息（SSE 流式）
@@ -144,10 +164,16 @@ async def chat(payload: ChatRequest):
 
     - stream=True: 返回 SSE 流（text/event-stream）
     - stream=False: 返回完整响应（ApiResponse）
+    - workflow_mode: react(边思考边行动) / plan_and_execute(先计划后执行) / hybrid(混合模式)
     """
     if payload.stream:
         return StreamingResponse(
-            chat_service.chat(payload.conversation_id, payload.content),
+            chat_service.chat(
+                payload.conversation_id,
+                payload.content,
+                workflow_mode=payload.workflow_mode,
+                attachments=payload.attachments,
+            ),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
@@ -156,7 +182,8 @@ async def chat(payload: ChatRequest):
             },
         )
     result = await chat_service.chat_non_stream(
-        payload.conversation_id, payload.content
+        payload.conversation_id, payload.content, workflow_mode=payload.workflow_mode,
+        attachments=payload.attachments,
     )
     return ApiResponse(data=result)
 

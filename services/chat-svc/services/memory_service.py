@@ -8,6 +8,8 @@ P1阶段直接读取数据库，不做远程调用。后续Phase可改造为远�
   - build_system_prompt: 组合 system_prompt + 长期记忆 + 上下文压缩提示
   - 上下文压缩 (T1-027): 历史消息 token 总和 > 阈值时，只取最近 10 条
 """
+from __future__ import annotations
+
 from typing import Any, Optional
 
 from sqlalchemy import select
@@ -170,19 +172,114 @@ class MemoryService:
         system_prompt: str,
         history: list[Message],
         user_content: str,
-    ) -> list[dict[str, str]]:
+        user_attachments: Optional[list] = None,
+    ) -> list[dict[str, Any]]:
         """组装 LLM 调用所需的 messages 列表
 
         结构: [system] + history(user/assistant) + [user]
+        多模态规则:
+          - 仅最新 user 消息（本轮 user_content + user_attachments 或历史最后一条 user）
+            在有附件时使用数组 content: [{type:'text',...}, {type:'image_url',...}]
+          - 历史 user 消息的附件降级为纯文本（附加一段提醒说明）
+          - 音频附件在本轮做文本 fallback；视觉附件生成 image_url 项
         """
-        messages: list[dict[str, str]] = [
+        messages: list[dict[str, Any]] = [
             {"role": "system", "content": system_prompt}
         ]
-        for m in history:
+
+        # 找到历史中最后一条 user 的索引，用于决定是否对历史附件降级
+        last_user_idx_in_history = -1
+        for idx, m in enumerate(history):
             role = "assistant" if m.message_type == "assistant" else "user"
-            messages.append({"role": role, "content": m.content or ""})
-        messages.append({"role": "user", "content": user_content})
+            if role == "user":
+                last_user_idx_in_history = idx
+
+        for idx, m in enumerate(history):
+            role = "assistant" if m.message_type == "assistant" else "user"
+            hist_attachments = getattr(m, "attachments", None)
+            if role == "user" and hist_attachments:
+                # 历史 user 的附件：仅最后一条历史 user 若未被本轮覆盖（实际不会，因为本轮是新 user）
+                # 但为了安全，按规则统一降级纯文本（历史图片不注入），附加 fallback 说明
+                text_content = m.content or ""
+                note = self._attachments_fallback_note(hist_attachments)
+                if note:
+                    text_content = (text_content + "\n\n" + note).strip()
+                messages.append({"role": role, "content": text_content})
+            else:
+                messages.append({"role": role, "content": m.content or ""})
+
+        # 本轮最新 user 消息 → 可能使用数组内容
+        if user_attachments:
+            messages.append(self._build_user_message_with_attachments(
+                user_content, user_attachments
+            ))
+        else:
+            messages.append({"role": "user", "content": user_content})
         return messages
+
+    # ── 多模态附件内部助手 ────────────────────────────
+
+    @staticmethod
+    def _attachments_fallback_note(attachments: list) -> str:
+        """历史附件的纯文本 fallback 提醒（用于历史 user 消息降级）"""
+        if not attachments:
+            return ""
+        image_names: list[str] = []
+        audio_names: list[str] = []
+        for a in attachments:
+            if not isinstance(a, dict):
+                continue
+            t = str(a.get("type") or "").lower()
+            name = a.get("name") or "(未命名)"
+            if t.startswith("image") or t == "img":
+                image_names.append(name)
+            elif t.startswith("audio"):
+                audio_names.append(name)
+        parts: list[str] = []
+        if image_names:
+            parts.append(f"[用户当时还发送了图片附件：{', '.join(image_names)}，当前仅文本回顾]")
+        if audio_names:
+            parts.append(f"[用户当时还发送了音频附件：{', '.join(audio_names)}，当前仅文本回顾]")
+        return "\n".join(parts)
+
+    @staticmethod
+    def _build_user_message_with_attachments(
+        text_content: str, attachments: list
+    ) -> dict[str, Any]:
+        """构造最新 user 消息：附件数组注入 + 音频文本 fallback"""
+        parts: list[dict[str, Any]] = []
+        # 追加 text（含音频 fallback 说明）
+        audio_fallbacks: list[str] = []
+        image_items: list[dict[str, Any]] = []
+        for a in attachments or []:
+            if not isinstance(a, dict):
+                continue
+            t = str(a.get("type") or "").lower()
+            name = a.get("name") or "(未命名)"
+            if t.startswith("image") or t == "img":
+                url = a.get("data_url") or a.get("url") or ""
+                if not url:
+                    continue
+                image_items.append({
+                    "type": "image_url",
+                    "image_url": {"url": url, "detail": "auto"},
+                })
+            elif t.startswith("audio"):
+                # 音频：文本 fallback（预留后续 input_audio 扩展点）
+                audio_fallbacks.append(name)
+            else:
+                # 未知类型：追加一行说明
+                audio_fallbacks.append(f"{name}(type={t or 'unknown'})")
+        text = text_content or ""
+        if audio_fallbacks:
+            note = (
+                f"\n\n[用户还发送了音频附件："
+                f"\"{', '.join(audio_fallbacks)}\"]，当前会话音频支持取决于模型。"
+            )
+            text = (text + note).strip()
+        parts.append({"type": "text", "text": text})
+        parts.extend(image_items)
+        return {"role": "user", "content": parts}
 
     # ── 内部工具 ──────────────────────────────────────
 
