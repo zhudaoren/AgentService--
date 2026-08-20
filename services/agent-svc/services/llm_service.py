@@ -15,6 +15,7 @@ from common.exceptions import (
     NotFoundException,
     ValidationException,
     LLMException,
+    BadRequestException,
 )
 from common.logger import get_logger
 from common.schemas import LLMConfigCreate, LLMConfigUpdate, LLMConfigOut
@@ -115,6 +116,16 @@ class LLMConfigService:
         config = await self._get_by_id(db, config_id)
 
         data = payload.model_dump(exclude_unset=True)
+
+        # 官方内置 LLM 禁止修改 name / provider / model_name
+        if config.is_builtin:
+            protected_fields = {"name", "provider", "model_name"}
+            for field in protected_fields:
+                if field in data and data[field] != getattr(config, field):
+                    raise BadRequestException("官方内置LLM不允许修改名称/provider/模型名")
+            for field in protected_fields:
+                data.pop(field, None)
+
         # api_key 特殊处理: 提供非空值则加密; None/空串跳过(保留原值)
         if "api_key" in data:
             new_key = data["api_key"]
@@ -140,6 +151,8 @@ class LLMConfigService:
 
     async def delete_config(self, db: AsyncSession, config_id: str) -> None:
         config = await self._get_by_id(db, config_id)
+        if config.is_builtin:
+            raise BadRequestException("官方内置LLM配置不可删除")
         await db.delete(config)
         await db.flush()
         logger.info(f"删除LLM配置: id={config_id}")
@@ -217,6 +230,7 @@ class LLMConfigService:
             api_base_url=config.api_base_url or "",
             default_params=config.default_params or {},
             is_default=bool(config.is_default),
+            is_builtin=bool(config.is_builtin),
             created_at=config.created_at,
             updated_at=config.updated_at,
         )

@@ -55,6 +55,10 @@ test_e2e.py
 test_skill_zip_import.py
 test_travel.py
 test_workflow_and_thinking_fix.py
+_test_skill_filter*.py
+
+# Trae IDE
+.trae/
 
 # Trae browser screenshots
 trae-browser-screenshots/

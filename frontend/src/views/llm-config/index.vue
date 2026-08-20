@@ -21,7 +21,11 @@
         @change="handleTableChange"
       >
         <template #bodyCell="{ column, record }">
-          <template v-if="column.key === 'provider'">
+          <template v-if="column.key === 'name'">
+            <span>{{ record.name }}</span>
+            <a-tag v-if="record.is_builtin" color="blue" style="margin-left: 6px">🛡️ 官方内置</a-tag>
+          </template>
+          <template v-else-if="column.key === 'provider'">
             <a-tag :color="providerColor(record.provider)">{{ record.provider }}</a-tag>
           </template>
           <template v-else-if="column.key === 'is_default'">
@@ -37,7 +41,12 @@
                 测试
               </a-button>
               <a-button type="link" size="small" @click="openEdit(record)">编辑</a-button>
-              <a-popconfirm title="确定删除该配置？" @confirm="handleDelete(record)">
+              <a-tooltip v-if="record.is_builtin" title="官方内置服务不可删除">
+                <a-popconfirm title="确定删除该配置？" @confirm="handleDelete(record)">
+                  <a-button type="link" size="small" danger :disabled="record.is_builtin">删除</a-button>
+                </a-popconfirm>
+              </a-tooltip>
+              <a-popconfirm v-else title="确定删除该配置？" @confirm="handleDelete(record)">
                 <a-button type="link" size="small" danger>删除</a-button>
               </a-popconfirm>
             </a-space>
@@ -56,13 +65,13 @@
       @cancel="modalVisible = false"
     >
       <a-form ref="formRef" :model="form" :rules="rules" layout="vertical">
-        <a-form-item label="配置名称" name="name">
-          <a-input v-model:value="form.name" placeholder="例如：生产环境 OpenAI" />
+        <a-form-item :label="currentIsBuiltin ? '配置名称（官方内置，不可修改）' : '配置名称'" name="name">
+          <a-input v-model:value="form.name" placeholder="例如：生产环境 OpenAI" :disabled="currentIsBuiltin" />
         </a-form-item>
         <a-row :gutter="16">
           <a-col :span="12">
-            <a-form-item label="提供商" name="provider">
-              <a-select v-model:value="form.provider" placeholder="选择提供商" @change="handleProviderChange">
+            <a-form-item :label="currentIsBuiltin ? '提供商（官方内置，不可修改）' : '提供商'" name="provider">
+              <a-select v-model:value="form.provider" placeholder="选择提供商" :disabled="currentIsBuiltin" @change="handleProviderChange">
                 <a-select-option v-for="p in providers" :key="p.value" :value="p.value">
                   {{ p.label }}
                 </a-select-option>
@@ -70,8 +79,8 @@
             </a-form-item>
           </a-col>
           <a-col :span="12">
-            <a-form-item label="模型名称" name="model_name">
-              <a-input v-model:value="form.model_name" placeholder="例如：gpt-4o-mini" />
+            <a-form-item :label="currentIsBuiltin ? '模型名称（官方内置，不可修改）' : '模型名称'" name="model_name">
+              <a-input v-model:value="form.model_name" placeholder="例如：gpt-4o-mini" :disabled="currentIsBuiltin" />
             </a-form-item>
           </a-col>
         </a-row>
@@ -139,6 +148,7 @@ const submitting = ref(false)
 const testingId = ref(null)
 const modalVisible = ref(false)
 const isEdit = ref(false)
+const currentIsBuiltin = ref(false)
 const formRef = ref()
 
 // 各提供商支持的参数列表（从后端获取）
@@ -272,12 +282,14 @@ function handleTableChange(pag) {
 
 function openCreate() {
   isEdit.value = false
+  currentIsBuiltin.value = false
   Object.assign(form, defaultForm())
   modalVisible.value = true
 }
 
 function openEdit(record) {
   isEdit.value = true
+  currentIsBuiltin.value = !!record.is_builtin
   const baseForm = defaultForm()
   // 编辑时回填掩码密钥（如 sk-***xxxx），让输入框显示黑点密文
   // 用户不修改则提交时自动跳过，需要更换时直接清空输入新值

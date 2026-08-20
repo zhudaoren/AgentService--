@@ -313,6 +313,12 @@ class MemoryService:
                 if memory.updated_at
                 else None
             ),
+            # 额外返回实际内容，供前端摘要弹窗直接展示
+            "user_profile": user_profile,
+            "environment_facts": environment_facts,
+            "experience": experience if isinstance(experience, list) else [],
+            "shared_items": shared_items if isinstance(shared_items, list) else [],
+            "summary": "",  # 预留综合摘要字段，后续可由 LLM 生成
         }
 
     # ── 内部工具 ──────────────────────────────────────
@@ -442,8 +448,10 @@ class MemoryService:
         raw_output: Optional[str] = None
         try:
             if hasattr(llm_adapter, "invoke"):
+                # invoke 接受 messages: list[dict]，包装成单条 user message
                 raw_output = await self._safe_call_str(
-                    llm_adapter.invoke, prompt
+                    llm_adapter.invoke,
+                    [{"role": "user", "content": prompt}],
                 )
             elif hasattr(llm_adapter, "complete"):
                 raw_output = await self._safe_call_str(

@@ -295,6 +295,7 @@
           <a-radio-group v-model:value="importOnlineForm.import_format">
             <a-radio-button value="markdown">Markdown (.md)</a-radio-button>
             <a-radio-button value="json">JSON (.json)</a-radio-button>
+            <a-radio-button value="zip">ZIP (多文件结构 .zip)</a-radio-button>
           </a-radio-group>
         </a-form-item>
       </a-form>

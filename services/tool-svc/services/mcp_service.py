@@ -118,6 +118,16 @@ class MCPServiceMgr:
     ) -> MCPServiceOut:
         mcp = await self._get_by_id(db, mcp_id)
         data = payload.model_dump(exclude_unset=True)
+
+        # 官方内置 MCP 禁止修改 name / mode / sse_url / stdio_config
+        if mcp.is_builtin:
+            protected_fields = {"name", "mode", "sse_url", "stdio_config"}
+            for field in protected_fields:
+                if field in data and data[field] != getattr(mcp, field):
+                    raise BadRequestException("官方内置MCP不允许修改名称/mode/接入地址/stdio配置")
+            for field in protected_fields:
+                data.pop(field, None)
+
         for k, v in data.items():
             setattr(mcp, k, v)
         await db.flush()
@@ -126,6 +136,8 @@ class MCPServiceMgr:
 
     async def delete(self, db: AsyncSession, mcp_id: str) -> None:
         mcp = await self._get_by_id(db, mcp_id)
+        if mcp.is_builtin:
+            raise BadRequestException("官方内置MCP服务不可删除")
         if mcp_id in self._adapters:
             try:
                 await self._adapters[mcp_id].disconnect()
@@ -835,6 +847,7 @@ class MCPServiceMgr:
             stdio_config=mcp.stdio_config or {},
             status=mcp.status,
             error_message=mcp.error_message or "",
+            is_builtin=bool(mcp.is_builtin),
             last_connected_at=mcp.last_connected_at,
             created_at=mcp.created_at,
             updated_at=mcp.updated_at,

@@ -66,6 +66,7 @@ try:
                 api_base_url="https://api.deepseek.com",
                 default_params=json.dumps(dict(temperature=0.7, max_tokens=4096, top_p=0.9), ensure_ascii=False),
                 is_default=1,
+                is_builtin=1,
                 created_at=now, updated_at=now,
             ))
             print(f"✓ LLM config inserted: id={llm_id}")
@@ -85,6 +86,7 @@ try:
                 status="disconnected",
                 auth_type="none",
                 oauth_status="not_configured",
+                is_builtin=1,
                 created_at=now, updated_at=now,
             ))
             print(f"✓ MCP service inserted: id={mcp_id}")

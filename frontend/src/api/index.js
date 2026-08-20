@@ -290,7 +290,12 @@ export const skillApi = {
     request.post('/skills/import/local', formData, {
       headers: { 'Content-Type': 'multipart/form-data' },
     }),
-  importOnline: (data) => request.post('/skills/import/online', data),
+  importOnline: (opts = {}) =>
+    request.post('/skills/import/online', {
+      source_url: opts.source_url,
+      import_format: opts.import_format || 'markdown',
+      category: opts.category || 'general',
+    }),
   progressive: (id, level) =>
     request.get(`/skills/${encodeURIComponent(id)}/progressive`, { params: { level } }),
 }

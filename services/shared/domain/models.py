@@ -25,6 +25,7 @@ class LLMConfig(Base):
     api_base_url: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
     default_params: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
     is_default: Mapped[bool] = mapped_column(Boolean, default=False)
+    is_builtin: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -98,6 +99,7 @@ class Message(Base):
     thinking: Mapped[Optional[str]] = mapped_column(Text().with_variant(Text(length=16777215), "mysql"), nullable=True)
     tool_calls: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
     tool_results: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    attachments: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
     token_count: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
@@ -129,6 +131,7 @@ class MCPService(Base):
     )
     error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     last_connected_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    is_builtin: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -196,6 +199,7 @@ class Skill(Base):
     storage_path: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     usage_count: Mapped[int] = mapped_column(Integer, default=0)
+    success_count: Mapped[int] = mapped_column(Integer, default=0)
     success_rate: Mapped[float] = mapped_column(Float, default=0.0)
     author: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     tags: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)

@@ -172,6 +172,7 @@ async def chat(payload: ChatRequest):
                 payload.conversation_id,
                 payload.content,
                 workflow_mode=payload.workflow_mode,
+                attachments=payload.attachments,
             ),
             media_type="text/event-stream",
             headers={
@@ -182,6 +183,7 @@ async def chat(payload: ChatRequest):
         )
     result = await chat_service.chat_non_stream(
         payload.conversation_id, payload.content, workflow_mode=payload.workflow_mode,
+        attachments=payload.attachments,
     )
     return ApiResponse(data=result)
 

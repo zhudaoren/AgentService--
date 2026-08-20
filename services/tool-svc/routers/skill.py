@@ -5,6 +5,7 @@ from fastapi import APIRouter, Depends, Query, UploadFile, File, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from common.exceptions import ValidationException
 from common.schemas import (
     ApiResponse,
     PageData,
@@ -14,6 +15,7 @@ from common.schemas import (
     SkillLevelOut,
     SkillOnlineImport,
     SkillProgressiveResponse,
+    SkillIncrementUsage,
 )
 from infrastructure.db import get_db
 from services.skill_service import skill_service, skill_import_service
@@ -144,13 +146,12 @@ async def import_skill_local(
 @skill_router.post("/skills/import/online", response_model=ApiResponse)
 async def import_skill_online(
     payload: SkillOnlineImport,
-    import_format: str = Query("markdown", description="markdown/json/skill"),
     db: AsyncSession = Depends(get_db),
 ):
-    """在线导入：通过 URL 拉取 markdown/json/skill 内容"""
-    fmt = (import_format or "markdown").lower()
-    if fmt not in ("markdown", "json", "skill"):
-        fmt = "markdown"
+    """在线导入：通过 URL 拉取 markdown/json/zip 内容"""
+    fmt = (payload.import_format or "markdown").lower()
+    if fmt not in {"markdown", "json", "zip"}:
+        raise ValidationException("import_format 仅支持 markdown/json/zip")
     skill = await skill_import_service.import_from_url(
         db,
         source_url=payload.source_url,
@@ -168,3 +169,16 @@ async def get_skill_progressive(
     """渐进式披露：按 level 返回 Skill Prompt"""
     result = await skill_service.get_progressive(db, skill_id, level)
     return ApiResponse(data=result.model_dump())
+
+
+@skill_router.post("/skills/{skill_id}/increment_usage", response_model=ApiResponse)
+async def increment_skill_usage(
+    skill_id: str,
+    payload: SkillIncrementUsage,
+    db: AsyncSession = Depends(get_db),
+):
+    """内网可信接口：chat-svc 判定 Skill 被使用后调用此接口累计次数与成功率。
+    无额外鉴权，部署时受内网/gateway 隔离保护。
+    """
+    updated = await skill_service.increment_usage(db, skill_id, payload.success)
+    return ApiResponse(data=updated.model_dump())

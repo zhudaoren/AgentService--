@@ -287,6 +287,7 @@ class ChatService:
         conversation_id: str,
         content: str,
         workflow_mode: Optional[str] = None,
+        attachments: Optional[list] = None,
     ) -> AsyncIterator[str]:
         """流式对话核心 (P2: ReAct + Plan-and-Execute + Tool Calling) - SSE 事件流生成器
 
@@ -330,6 +331,7 @@ class ChatService:
                 conversation_id=conversation_id,
                 message_type="user",
                 content=content,
+                attachments=attachments,
             )
             await session.commit()
 
@@ -380,51 +382,56 @@ class ChatService:
                     memory_service.compress_messages(history)
                 )
 
-            # 7. 组装 system_prompt（含 Skills Level0 + MCP 工具列表）
+            # 7. Skills 按需预筛选：仅注入与用户 query 相关的 skills，减少上下文开销
+            active_skills = self._select_relevant_skills(content, skills)
+
+            # 8. 组装 system_prompt（仅包含 active_skills，避免无关技能稀释上下文）
             system_prompt = self._build_system_prompt_with_tools(
                 base_prompt=agent.system_prompt or "",
                 long_term_memory=long_term,
                 compressed_summary=compressed_summary,
                 mcp_services=mcp_services,
-                skills=skills,
+                skills=active_skills,
             )
 
-            # 8. 构建 LLM 适配器
+            # 9. 构建 LLM 适配器
             config_dict = self._build_llm_config_dict(llm_config, agent)
             adapter = await create_llm_from_config(
                 config_dict, decrypt_fn=crypto_service.decrypt
             )
 
-            # 9. 组装初始 LLM messages（P2 ReAct 模式下会包含 tool_call/tool_result）
+            # 10. 组装初始 LLM messages（P2 ReAct 模式下会包含 tool_call/tool_result）
             llm_messages: list[dict] = memory_service.to_llm_messages(
                 system_prompt=system_prompt,
                 history=history,
                 user_content=content,
+                user_attachments=attachments,
             )
 
-            # 10. 构建 LLM 可用的 tool_defs（从 MCP tools 生成）
+            # 11. 构建 LLM 可用的 tool_defs（从 MCP tools 生成）
             llm_tool_defs = self._build_llm_tool_definitions(mcp_services)
 
-            # 10.1 发送可用 Skills 列表事件（前端可展示"使用了哪些技能"）
-            if skills:
+            # 11.1 发送可用 Skills 列表事件（前端可展示"使用了哪些技能"）
+            if active_skills:
                 skills_summary = [
                     {
                         "name": s.get("name", ""),
                         "description": s.get("description", ""),
                         "category": s.get("category", ""),
+                        "id": s.get("id", ""),
                     }
-                    for s in skills
+                    for s in active_skills
                 ]
                 yield self._sse_event("skills_available", {
                     "skills": skills_summary,
                     "total": len(skills_summary),
                 })
 
-        # 11. 注册停止事件
+        # 12. 注册停止事件
         stop_event = asyncio.Event()
         self._stop_events[conversation_id] = stop_event
 
-        # 12. (P2) ReAct 主循环
+        # 13. (P2) ReAct 主循环
         react_messages_for_persist: list[Message] = []
         final_assistant_text = ""
         final_assistant_tool_calls: list[dict] = []
@@ -436,6 +443,7 @@ class ChatService:
         try:
             # ── Plan-and-Execute：在进入 ReAct 主循环前，先产出一份执行计划 ──
             plan_steps: list[dict] = []
+            plan_duration: int = 0
             plan_for_context: str = ""  # 在外层初始化，避免未定义变量引用
             if strategy_mode == "plan_and_execute" and has_tools_or_skills:
                 import time as _time
@@ -504,14 +512,17 @@ class ChatService:
                 stream_as_thinking = bool(llm_tool_defs)
                 logger.info(f"[DEBUG] ReAct#{iteration} setup: enable_react={enable_react}, llm_tool_defs={len(llm_tool_defs) if llm_tool_defs else 0}, provider={adapter.provider}, use_function_calling={use_function_calling}, use_text_react={use_text_react}, stream_as_thinking={stream_as_thinking}")
                 thinking_start_ts: Optional[float] = None
+                iteration_reasoning: str = ""  # 本轮累积的 reasoning_content，用于回传到下一轮
+                tool_results_list: list[dict] = []  # 本轮工具结果（用于异常时的降级合成回答）
+                assistant_text: str = ""  # 本轮 LLM 的纯文本输出（在 except LLMException 降级分支兜底使用）
                 try:
+                    # ── 新建本轮 content 缓冲区 ──
+                    round_content_buffer: list[str] = []  # 累积本轮所有 content
+                    round_reasoning_buffer: list[str] = []  # 累积 reasoning_content
+
                     if use_function_calling:
-                        # Function calling 模式：真正流式 + 实时推送
-                        if stream_as_thinking:
-                            thinking_start_ts = time.time()
-                            yield self._sse_event("thinking_start", {
-                                "iteration": iteration,
-                            })
+                        # Function calling 模式：缓冲流式内容，不立即推送
+                        # 等流结束后根据 has_tool_calls 决定走 thinking 还是 message
                         try:
                             async for chunk in self._stream_llm_with_tools(
                                 adapter, llm_messages, llm_tool_defs,
@@ -523,77 +534,69 @@ class ChatService:
                                     if typ == "content":
                                         if val:
                                             full_text_parts.append(val)
-                                            # 实时推送流式内容（thinking 或 message）
-                                            if stream_as_thinking:
-                                                yield self._sse_event("thinking", {
-                                                    "content": val,
-                                                    "iteration": iteration,
-                                                    "streaming": True,
-                                                })
-                                            else:
-                                                yield self._sse_event("message", {
-                                                    "role": "assistant", "content": val,
-                                                })
+                                            round_content_buffer.append(val)
                                     elif typ == "tool_call":
                                         detected_tool_calls.append(val)
+                                    elif typ == "reasoning_content":
+                                        if isinstance(val, str) and val:
+                                            iteration_reasoning = val
+                                            round_reasoning_buffer.append(val)
                                 elif isinstance(chunk, str):
                                     if chunk:
                                         full_text_parts.append(chunk)
-                                        if stream_as_thinking:
-                                            yield self._sse_event("thinking", {
-                                                "content": chunk,
-                                                "iteration": iteration,
-                                                "streaming": True,
-                                            })
-                                        else:
-                                            yield self._sse_event("message", {
-                                                "role": "assistant", "content": chunk,
-                                            })
+                                        round_content_buffer.append(chunk)
                         except Exception:
-                            # 降级：纯文本流
+                            # 降级：纯文本流（仍缓冲，不推送）
                             async for chunk in adapter.stream(llm_messages):
                                 if stop_event.is_set():
                                     break
                                 if chunk:
                                     full_text_parts.append(chunk)
-                                    if stream_as_thinking:
-                                        yield self._sse_event("thinking", {
-                                            "content": chunk,
-                                            "iteration": iteration,
-                                            "streaming": True,
-                                        })
-                                    else:
-                                        yield self._sse_event("message", {
-                                            "role": "assistant", "content": chunk,
-                                        })
+                                    round_content_buffer.append(chunk)
                     else:
                         # 纯文本 ReAct Prompt 模式 或 无工具纯对话
-                        if stream_as_thinking:
-                            thinking_start_ts = time.time()
-                            yield self._sse_event("thinking_start", {
-                                "iteration": iteration,
-                            })
                         async for chunk in adapter.stream(llm_messages):
                             if stop_event.is_set():
                                 break
                             if chunk:
                                 full_text_parts.append(chunk)
-                                if stream_as_thinking:
-                                    yield self._sse_event("thinking", {
-                                        "content": chunk,
-                                        "iteration": iteration,
-                                        "streaming": True,
-                                    })
-                                else:
-                                    yield self._sse_event("message", {
-                                        "role": "assistant", "content": chunk,
-                                    })
+                                round_content_buffer.append(chunk)
                         # 尝试从文本中解析 ACTION/THOUGHT/OBSERVATION 格式的工具调用
                         detected_tool_calls = self._parse_react_tool_calls_from_text(
                             "".join(full_text_parts), mcp_services
                         )
                 except LLMException as e:
-                    logger.error(f"LLM 流式调用失败(ReAct#{iteration}): {e.message}")
+                    logger.error(f"LLM 流式调用失败(ReAct#{iteration}): {e.message}", exc_info=True)
+                    # ── Graceful degradation：优先保存已有的有效最终回答 ──
+                    # 如果之前的循环已经产出了足够长度的最终回答（非纯错误文本），
+                    # 就把它作为 assistant 保存，不让用户页面刷新后看到红色错误卡。
+                    _already_has_final = bool(final_assistant_text) and len(final_assistant_text) >= 80
+                    # 若无 final，但已有中间推理/工具输出：直接合成最终回答
+                    _has_intermediate = (
+                        (bool(final_thinking_content) and len(final_thinking_content) >= 120)
+                        or (bool(tool_results_list) and (assistant_text and len(assistant_text) >= 80))
+                    )
+                    if _already_has_final or (_has_intermediate and iteration > 0):
+                        if not _already_has_final:
+                            # 组装一个可用的降级最终回答：拼接已有推理文本 + 工具结果摘要
+                            _parts: list[str] = []
+                            if assistant_text and len(assistant_text) >= 80:
+                                _parts.append(assistant_text)
+                            if final_thinking_content and len(final_thinking_content) >= 120:
+                                _parts.append(final_thinking_content)
+                            final_assistant_text = "\n\n".join(_p for _p in _parts if _p).strip()
+                        # 把错误说明作为补充附加到回答末尾（用小字提醒格式）
+                        _err_note = (
+                            f"\n\n> ⚠️ 系统提示：后续模型调用失败（{e.message[:120]}），"
+                            "以上内容可能不完整，请稍后重试。"
+                        )
+                        final_assistant_text = final_assistant_text + _err_note
+                        yield self._sse_event("message", {
+                            "role": "assistant", "content": _err_note,
+                        })
+                        # 发送 done（正常结束标记），不要中断 UI
+                        yield self._sse_event("done", {"error": None, "degraded": True})
+                        break  # 退出主循环，走到 Step13 持久化 assistant
                     yield self._sse_event("message", {
                         "role": "error", "content": f"[LLM 调用失败] {e.message}",
                     })
@@ -641,25 +644,54 @@ class ChatService:
                 if thinking_start_ts is not None:
                     thinking_duration_ms = int((time.time() - thinking_start_ts) * 1000)
 
+                # ── 根据 has_tool_calls 决定缓冲内容的推送方式 ──
+                # 中间轮(有tool_calls): 走 thinking 事件
+                # 最终轮(无tool_calls): 走 message 事件，不进思考区
+                if stream_as_thinking and round_content_buffer:
+                    if not has_tool_calls and not looks_like_thinking:
+                        # 最终轮：直接走 message 事件，内容不进思考区
+                        # 先发送 thinking_done 清理前端状态（如果之前有中间轮）
+                        if final_thinking_content:
+                            yield self._sse_event("thinking_done", {
+                                "iteration": iteration,
+                                "duration_ms": thinking_duration_ms,
+                            })
+                            yield self._sse_event("thinking_to_answer", {
+                                "iteration": iteration,
+                                "duration_ms": thinking_duration_ms,
+                                "thinking_content": final_thinking_content,
+                            })
+                        else:
+                            # 没有中间推理，直接推送 message
+                            pass  # 什么都不发，避免前端产生迁移提示
+                    else:
+                        # 中间轮：先发送 thinking_start，再推送缓冲内容到思考区
+                        thinking_start_ts = time.time()
+                        yield self._sse_event("thinking_start", {
+                            "iteration": iteration,
+                        })
+                        # 推送 reasoning_content 到思考区
+                        for rc in round_reasoning_buffer:
+                            yield self._sse_event("thinking", {
+                                "content": rc,
+                                "iteration": iteration,
+                                "streaming": False,
+                                "reasoning_content": True,
+                            })
+                        # 推送 content 到思考区
+                        for content in round_content_buffer:
+                            yield self._sse_event("thinking", {
+                                "content": content,
+                                "iteration": iteration,
+                                "streaming": True,
+                            })
+
                 if not has_tool_calls and not looks_like_thinking:
                     # 纯文本最终答案 → break 主循环
                     final_assistant_tool_calls.extend(detected_tool_calls)
                     logger.info(f"[DEBUG] ReAct#{iteration}: 最终回复确定阶段, raw_assistant_length={len(assistant_text)}, final_thinking_content_len={len(final_thinking_content)}, strategy_mode={strategy_mode}, plan_steps_count={len(plan_steps)}, tools_executed={len(final_assistant_tool_calls)}")
 
                     if stream_as_thinking:
-                        # 最终轮：发送 thinking_done（标记最后一轮思考结束）
-                        yield self._sse_event("thinking_done", {
-                            "iteration": iteration,
-                            "duration_ms": thinking_duration_ms,
-                        })
-                        # 发送 thinking_to_answer，携带 thinking_content（仅中间轮推理）
-                        # answer_text 改为通过 message 事件流式推送，让前端在回答区块中展示流式效果
-                        yield self._sse_event("thinking_to_answer", {
-                            "iteration": iteration,
-                            "duration_ms": thinking_duration_ms,
-                            "thinking_content": final_thinking_content if final_thinking_content else None,
-                        })
-
                         # ── P&E 模式增强：有计划+有工具执行 → 额外做一次显式综合总结 LLM 调用 ──
                         is_pe_with_execution = (
                             strategy_mode == "plan_and_execute"
@@ -734,7 +766,12 @@ class ChatService:
                             final_assistant_text = "".join(summary_parts)
                         logger.info(f"[DEBUG] 最终回答长度: final_assistant_text_len={len(final_assistant_text)}")
                     else:
-                        # 无工具绑定的纯对话场景：流式期间已作为 message 实时推送
+                        # 无工具绑定的纯对话场景：直接推送缓冲内容为 message 事件
+                        for content in round_content_buffer:
+                            yield self._sse_event("message", {
+                                "role": "assistant",
+                                "content": content,
+                            })
                         final_assistant_text = assistant_text
                     break
 
@@ -744,12 +781,13 @@ class ChatService:
                 else:
                     final_thinking_content = f"**第 {iteration + 1} 轮推理**\n\n{assistant_text}" if iteration > 0 else assistant_text
 
-                # thinking 已在流式期间推送，发送 thinking_done（带时长）
-                # 无论 content 是否为空，都应该发送 thinking_done
-                yield self._sse_event("thinking_done", {
-                    "iteration": iteration,
-                    "duration_ms": thinking_duration_ms,
-                })
+                # thinking 已在前面的缓冲推送逻辑中发送（thinking_start + thinking + thinking_done）
+                # 这里只处理非 stream_as_thinking 场景的 thinking_done
+                if not stream_as_thinking:
+                    yield self._sse_event("thinking_done", {
+                        "iteration": iteration,
+                        "duration_ms": thinking_duration_ms,
+                    })
                 # 先补全 mcp_service_name（基于 mcp_services 构建 tool_name → mcp_name 映射）
                 tool_to_mcp_name: dict[str, str] = {}
                 tool_to_mcp_id: dict[str, str] = {}
@@ -791,6 +829,11 @@ class ChatService:
                     "role": "assistant",
                     "content": assistant_text or "",
                 }
+                # ── reasoning_content 回传 ──
+                # DeepSeek R1 / thinking 模型：若本轮产生了 reasoning_content，必须在
+                # 下一轮请求中透传给 API，否则会抛 400 "reasoning_content must be passed back"
+                if isinstance(iteration_reasoning, str) and iteration_reasoning.strip():
+                    assistant_llm_msg["reasoning_content"] = iteration_reasoning
                 if detected_tool_calls:
                     assistant_llm_msg["tool_calls"] = [
                         {
@@ -806,7 +849,7 @@ class ChatService:
                 llm_messages.append(assistant_llm_msg)
 
                 # 逐个调用工具（串行，简单实现），每个都推 tool_call 事件
-                tool_results_list: list[dict] = []
+                tool_results_list.clear()
                 for idx, tool_call in enumerate(detected_tool_calls):
                     if stop_event.is_set():
                         break
@@ -900,6 +943,7 @@ class ChatService:
                     llm_messages.append({
                         "role": "tool",
                         "tool_call_id": tool_call_id,
+                        "name": tool_name,
                         "content": observation_text,
                     })
 
@@ -950,10 +994,88 @@ class ChatService:
         finally:
             self._stop_events.pop(conversation_id, None)
 
-        # 13. 持久化最终 AI 回复（附带思考内容）
+        # 12.5 Skill 调用统计：detect + HTTP increment_usage（静默，不影响 SSE）
+        try:
+            conv_success = bool(
+                final_assistant_text.strip() != ""
+                and len(final_assistant_text) >= 20
+                and not stop_event.is_set()
+            )
+            used_ids = self._detect_used_skills(
+                content, skills, final_assistant_text or "",
+                len(final_assistant_text or ""),
+            )
+            if used_ids:
+                client = self._get_tool_http_client()
+                if client is not None:
+                    for sid in used_ids:
+                        try:
+                            resp = await client.post(
+                                f"{self.TOOL_SVC_BASE}/api/v1/skills/{sid}/increment_usage",
+                                json={"success": conv_success},
+                                timeout=5.0,
+                            )
+                            if resp.status_code != 200:
+                                logger.warning(
+                                    f"Skill increment_usage failed skill_id={sid}: HTTP {resp.status_code}"
+                                )
+                                continue
+                            resp_data = resp.json()
+                            # ApiResponse 兼容：{code, data, message}，即使读取 data 失败也不冒泡
+                            if (
+                                isinstance(resp_data, dict)
+                                and "code" in resp_data
+                                and resp_data.get("code") != 0
+                            ):
+                                logger.warning(
+                                    f"Skill increment_usage failed skill_id={sid}: "
+                                    f"code={resp_data.get('code')}, msg={resp_data.get('message','')[:100]}"
+                                )
+                                continue
+                            logger.info(
+                                f"Skill increment_usage success: skill_id={sid}, success={conv_success}"
+                            )
+                        except Exception as e:
+                            logger.warning(f"Skill increment_usage failed skill_id={sid}: {e}")
+        except Exception as e:
+            logger.warning(f"Skill usage stats outer guard caught error: {e}")
+
+        # 13. 持久化最终 AI 回复（附带思考内容 + 计划 + 技能 + 工具状态）
         tool_calls_for_save = None
-        if final_assistant_tool_calls:
-            tool_calls_for_save = {"calls": final_assistant_tool_calls}
+        if final_assistant_tool_calls or plan_steps or skills:
+            # 给每个 tool_call 附带 status（success/failed），保证刷新后状态不丢失
+            calls_with_status: list[dict] = []
+            for tc in final_assistant_tool_calls:
+                tc_copy = dict(tc)
+                # 如果 tc 已经在 tool_results_list 中（按 tool_name 匹配），取其 status
+                matched = next(
+                    (r for r in tool_results_list
+                     if r.get("tool_name") == tc.get("tool_name") or r.get("name") == tc.get("tool_name")),
+                    None,
+                )
+                tc_copy["status"] = (matched or {}).get("status", "success")
+                tc_copy["result"] = (matched or {}).get("result")
+                tc_copy["error"] = (matched or {}).get("error", "")
+                tc_copy["duration_ms"] = (matched or {}).get("duration_ms", 0)
+                calls_with_status.append(tc_copy)
+            # 构建完整结构：calls + plan_steps + skills_used
+            skills_used_summary = []
+            if active_skills:
+                skills_used_summary = [
+                    {
+                        "name": s.get("name", ""),
+                        "description": s.get("description", ""),
+                        "category": s.get("category", ""),
+                        "id": s.get("id", ""),
+                    }
+                    for s in active_skills
+                ]
+            tool_calls_for_save = {
+                "calls": calls_with_status,
+                "_plan_steps": plan_steps or [],
+                "_skills_used": skills_used_summary,
+                "_plan_duration_ms": plan_duration,
+            }
         # 思考内容落库策略：
         # - 有多轮中间推理（final_thinking_content 非空）：保存中间轮推理过程
         # - 无中间推理（单轮直接输出最终回答）：保存 None，前端显示迁移提示
@@ -976,6 +1098,15 @@ class ChatService:
             done_payload["fallback"] = True
             done_payload["fallback_message"] = "已自动降级为模型默认参数"
         yield self._sse_event("done", done_payload)
+
+        # ── Step 15: 异步触发长期记忆评估（best-effort，不阻塞响应） ──
+        try:
+            await self._trigger_memory_evaluation(
+                agent_id=agent.id,
+                conversation_id=conversation_id,
+            )
+        except Exception as mem_err:
+            logger.warning(f"[Memory] 长期记忆评估触发失败（不影响对话）: {mem_err}")
 
     # ── 辅助：stream LLM 并尝试捕获 tool_calls ──────
 
@@ -1004,12 +1135,25 @@ class ChatService:
             # 真正流式：用 astream 实时推送 content，同时累积 tool_call_chunks
             accumulated_tool_calls: dict[int, dict] = {}  # index → {name, args_str}
             streamed_content_parts: list[str] = []  # 跟踪已流式输出的内容，避免非流式回退时重复推送
+            reasoning_content_parts: list[str] = []  # 累积 thinking/reasoning 模型返回的 reasoning_content
             logger.info(f"[DEBUG] 开始 astream 调用，tools_count={len(tool_defs)}")
             chunk_count = 0
             tool_call_chunk_count = 0
             try:
                 async for chunk_msg in bound.astream(lc_messages):
                     chunk_count += 1
+                    # ── reasoning_content 捕获（DeepSeek-R1 / 思考模型） ──────
+                    # 若开启 reasoning，LangChain 会把 reasoning token 流作为
+                    # chunk.additional_kwargs["reasoning_content"] 逐个 chunk 返回。
+                    # 需要逐块累积，用于下一轮回传（否则 API 会报 400）。
+                    try:
+                        add_kw = getattr(chunk_msg, "additional_kwargs", None) or {}
+                        if isinstance(add_kw, dict):
+                            rc = add_kw.get("reasoning_content")
+                            if isinstance(rc, str) and rc:
+                                reasoning_content_parts.append(rc)
+                    except Exception:
+                        pass
                     # 实时 yield content（不等待全部完成）
                     content = getattr(chunk_msg, "content", "") or ""
                     if isinstance(content, list):
@@ -1056,7 +1200,7 @@ class ChatService:
                         )
             except Exception as e:
                 # 流式中途失败 → 降级为纯文本流式
-                logger.warning(f"astream with tools 失败: {e}，降级为纯流式")
+                logger.warning(f"astream with tools 失败: {e}，降级为纯流式", exc_info=True)
                 async for chunk in adapter.stream(llm_messages):
                     yield chunk
                 return
@@ -1147,8 +1291,14 @@ class ChatService:
                 })
                 logger.info(f"[DEBUG] yield tool_call: {tc_name}")
 
+            # ── 将本轮累积的 reasoning_content 汇总后抛出给上游（用于回传） ──
+            if reasoning_content_parts:
+                rc_joined = "".join(reasoning_content_parts)
+                if rc_joined.strip():
+                    yield ("reasoning_content", rc_joined)
+
         except Exception as e:
-            logger.warning(f"_stream_llm_with_tools 异常: {e}，降级为纯流式")
+            logger.warning(f"_stream_llm_with_tools 异常: {e}，降级为纯流式", exc_info=True)
             async for chunk in adapter.stream(llm_messages):
                 yield chunk
 
@@ -1383,6 +1533,195 @@ class ChatService:
             return True
 
         return False
+
+    # ── 辅助：Skills 按需预加载筛选 ─────────
+
+    @staticmethod
+    def _select_relevant_skills(user_query: str, skills: list[dict]) -> list[dict]:
+        """基于关键词 / 类别 / 名称匹配预筛选相关 skills。
+
+        核心逻辑：
+        1) 从用户 query 中抽取关键词（英文单词拆分 + 中文短语滑动窗口）
+        2) 对每个 skill，优先匹配名称（name）→ 次匹配描述（description/category）
+        3) 名称直接命中才算强相关；描述命中作为弱相关补充
+        4) 若全部未命中 → 回退全量（保守策略，避免漏掉关键技能）
+        """
+        if not skills:
+            return []
+        # 归一化用户 query
+        q = (user_query or "").lower()
+
+        # 1. 抽取关键词
+        primary_kw: set[str] = set()
+        segments = re.findall(r"[\u4e00-\u9fa5]+|[a-zA-Z0-9_\-]+", q)
+        for seg in segments:
+            seg = seg.strip().lower()
+            if not seg or len(seg) < 2:
+                continue
+            if any("\u4e00" <= c <= "\u9fa5" for c in seg):
+                # 中文段：用 2/3/4 字滑动窗口（避免整段过长导致零命中）
+                max_plen = min(4, len(seg))
+                for plen in range(2, max_plen + 1):
+                    for i in range(len(seg) - plen + 1):
+                        phrase = seg[i:i + plen]
+                        primary_kw.add(phrase)
+            else:
+                # 英文/数字段：按 -_ 空格 驼峰 拆分
+                snake = re.sub(r"([a-z])([A-Z])", r"\1_\2", seg).lower()
+                primary_kw.add(seg)
+                for sub in re.split(r"[-\s_]+", snake):
+                    sub = sub.strip().lower()
+                    if len(sub) >= 2:
+                        primary_kw.add(sub)
+
+        # 2. 构建 haystack 并匹配
+        def _skill_name(s: dict) -> str:
+            return str(s.get("name", "") or "").lower()
+
+        def _skill_haystack(s: dict) -> str:
+            return " ".join([
+                str(s.get("name", "") or ""),
+                str(s.get("description", "") or ""),
+                str(s.get("category", "") or ""),
+            ]).lower()
+
+        # 第一优先级：名称直接命中
+        name_matched: list[dict] = []
+        name_indexes: set[int] = set()
+        for idx, s in enumerate(skills):
+            name = _skill_name(s)
+            if name and any(k in name for k in primary_kw):
+                name_matched.append(s)
+                name_indexes.add(idx)
+
+        # 第二优先级：描述/分类命中（但名称未命中）
+        desc_matched: list[dict] = []
+        for idx, s in enumerate(skills):
+            if idx in name_indexes:
+                continue
+            haystack = _skill_haystack(s)
+            if haystack and any(k in haystack for k in primary_kw):
+                desc_matched.append(s)
+
+        # 合并：如果有名称命中，只返回名称命中的（更精准）
+        # 只有名称未命中时才回退到描述匹配
+        if name_matched:
+            primary_matched = name_matched
+        else:
+            primary_matched = desc_matched
+
+        # 3. 若 0 命中，尝试 2-gram 补充；仍为 0 → 回退全量
+        if not primary_matched:
+            gram_kw: set[str] = set()
+            compact = re.sub(r"\s+", "", q)
+            if len(compact) >= 2:
+                for i in range(len(compact) - 1):
+                    bi = compact[i:i + 2]
+                    if any("\u4e00" <= c <= "\u9fa5" for c in bi):
+                        gram_kw.add(bi)
+            if gram_kw:
+                for idx, s in enumerate(skills):
+                    if any(k in _skill_name(s) for k in gram_kw):
+                        if s not in primary_matched:
+                            primary_matched.append(s)
+                if not primary_matched:
+                    for idx, s in enumerate(skills):
+                        haystack = _skill_haystack(s)
+                        if haystack and any(g in haystack for g in gram_kw):
+                            if s not in primary_matched:
+                                primary_matched.append(s)
+
+        if not primary_matched:
+            logger.info(f"[Skills] 预筛选未命中，回退全量 skills={len(skills)}")
+            return list(skills)
+        logger.info(
+            f"[Skills] 预筛选命中 {len(primary_matched)}/{len(skills)} 个 skills，"
+            f"名称命中={len(name_matched)}，描述命中={len(desc_matched)}，"
+            f"keywords={sorted(primary_kw)[:8]}"
+        )
+        return primary_matched
+
+    # ── 辅助：触发长期记忆评估 ─────────
+
+    async def _trigger_memory_evaluation(
+        self, agent_id: str, conversation_id: str,
+    ) -> None:
+        """异步触发 mem-svc 的长期记忆评估（best-effort，不抛异常）。
+
+        调用 mem-svc POST /api/v1/memory/evaluate 接口，
+        将本轮对话历史提交给记忆评估器，判断是否有值得长期记忆的信息。
+        """
+        if not _HTTPX_AVAILABLE:
+            return
+        # 先从数据库加载本次会话的消息历史
+        conv_messages: list[dict] = []
+        try:
+            async with AsyncSessionLocal() as db:
+                msgs = await self._get_messages_for_llm(db, conversation_id)
+                conv_messages = msgs
+        except Exception as e:
+            logger.warning(f"[Memory] 加载会话消息失败: {e}")
+            return
+
+        if not conv_messages:
+            logger.info(f"[Memory] 会话 {conversation_id} 无消息，跳过长期记忆评估")
+            return
+
+        url = "http://localhost:8004/api/v1/memory/evaluate"
+        payload = {
+            "agent_id": agent_id,
+            "conversation_id": conversation_id,
+            "messages": conv_messages,
+        }
+        try:
+            client = self._get_memory_http_client()
+            if client is None:
+                return
+            resp = await client.post(url, json=payload, timeout=30)
+            if resp.status_code == 200:
+                body = resp.json() if resp.content else {}
+                data = body.get("data", {})
+                skipped = data.get("skipped", False)
+                applied = data.get("applied_count", 0)
+                logger.info(
+                    f"[Memory] 长期记忆评估完成: agent_id={agent_id}, "
+                    f"messages={len(conv_messages)}, skipped={skipped}, applied={applied}"
+                )
+            else:
+                logger.warning(
+                    f"[Memory] 长期记忆评估返回非200: status={resp.status_code}, "
+                    f"body={resp.text[:200]}"
+                )
+        except Exception as e:
+            logger.warning(f"[Memory] 长期记忆评估请求失败: {e}")
+
+    async def _get_messages_for_llm(
+        self, db: AsyncSession, conversation_id: str,
+    ) -> list[dict]:
+        """加载会话的消息历史，转为 LLM 可用的格式"""
+        from domain.models import Message as MessageModel
+        result = await db.execute(
+            select(MessageModel)
+            .where(MessageModel.conversation_id == conversation_id)
+            .order_by(MessageModel.created_at.asc())
+        )
+        msgs = result.scalars().all()
+        out = []
+        for m in msgs:
+            out.append({
+                "role": m.message_type,
+                "content": m.content or "",
+            })
+        return out
+
+    def _get_memory_http_client(self) -> Any:
+        """获取 mem-svc 的 HTTP 客户端（懒创建）"""
+        if not _HTTPX_AVAILABLE:
+            return None
+        if not hasattr(self, "_memory_http_client") or self._memory_http_client is None:
+            import httpx as _httpx
+            self._memory_http_client = _httpx.AsyncClient(timeout=45)
+        return self._memory_http_client
 
     # ── 辅助：构建 LangChain tool definitions ─────────
 
@@ -1679,6 +2018,7 @@ class ChatService:
                     .values(message_count=Conversation.message_count - deleted_count)
                 )
             regenerate_content = last_user.content or ""
+            regenerate_attachments = getattr(last_user, "attachments", None)
             agent_id = conv.agent_id
             logger.info(
                 f"重新生成: conversation_id={conversation_id}, "
@@ -1688,7 +2028,7 @@ class ChatService:
             await session.commit()
 
         # 委托给 chat() 进行流式重新生成
-        async for event in self.chat(conversation_id, regenerate_content):
+        async for event in self.chat(conversation_id, regenerate_content, attachments=regenerate_attachments):
             yield event
 
     # ── 对话编排（非流式） ───────────────────────────
@@ -1698,6 +2038,7 @@ class ChatService:
         conversation_id: str,
         content: str,
         workflow_mode: Optional[str] = None,
+        attachments: Optional[list] = None,
     ) -> dict[str, Any]:
         """非流式对话 - 返回完整响应 (P2 封装流式的收集)"""
         if not content or not content.strip():
@@ -1708,7 +2049,7 @@ class ChatService:
         last_err: Optional[str] = None
         event_count = 0
         try:
-            async for sse in self.chat(conversation_id, content, workflow_mode=workflow_mode):
+            async for sse in self.chat(conversation_id, content, workflow_mode=workflow_mode, attachments=attachments):
                 event_count += 1
                 # 解析 SSE：简单按 event: xxx / data: {...} 拆分
                 parsed = self._parse_sse_event(sse)
@@ -1758,6 +2099,108 @@ class ChatService:
         event.set()
         logger.info(f"已发送停止信号: conversation_id={conversation_id}")
         return True
+
+    # ── Skill 调用检测（启发式） ───────────────────────
+
+    def _detect_used_skills(
+        self,
+        user_query: str,
+        skills: list[dict],
+        assistant_text: str,
+        final_answer_len: int,
+    ) -> list[str]:
+        """判定本轮对话哪些 Skill 实际被使用，返回 skill_id 列表（去重）。
+
+        三条启发式规则，命中任意一条即加入集合。
+        """
+        if not skills:
+            return []
+        used_ids: set[str] = set()
+        query = (user_query or "").strip()
+        answer = (assistant_text or "").strip()
+        answer_lower = answer.lower()
+
+        # 中文深度调研关键词（规则1兜底 + 规则3判断）
+        research_keywords_cn = ("深度调研", "深度分析", "调研", "分析报告", "对比报告", "方案", "竞品分析", "研究")
+        deep_research_categories = ("research", "analysis", "report", "deep-research")
+        has_research_query_flag = any(kw in query for kw in research_keywords_cn)
+
+        # ── 规则1：字符级 Jaccard 重叠度 / 中文关键词强命中 ──
+        jaccard_scores: list[tuple[str, float]] = []
+        for s in skills:
+            sid = s.get("id")
+            if not sid:
+                continue
+            sname = s.get("name", "") or ""
+            sdesc = s.get("description", "") or ""
+            scat = s.get("category", "") or ""
+            stags = s.get("tags") or []
+            skill_text = f"{sname} {sdesc} {scat} {' '.join(stags)}".strip()
+            # Jaccard
+            q_chars = set(query)
+            s_chars = set(skill_text)
+            if q_chars or s_chars:
+                union_len = max(1, len(q_chars | s_chars))
+                jacc = len(q_chars & s_chars) / union_len
+            else:
+                jacc = 0.0
+            jaccard_scores.append((sid, jacc))
+            if jacc >= 0.25:
+                used_ids.add(sid)
+            # 中文关键词兜底强命中
+            if has_research_query_flag and ("调研" in sname or scat in deep_research_categories):
+                used_ids.add(sid)
+
+        # ── 规则2：assistant_text 锚点扫描 + 60 字符窗口匹配 ──
+        if answer:
+            anchor_patterns = [
+                r"Skill[:：]",
+                r"【调用\s*Skill[:：]",
+                r"使用技能",
+                r"load\s+level\s+[12]\s+of",
+                r"技能[:：]",
+            ]
+            anchor_positions: list[int] = []
+            for pat in anchor_patterns:
+                for m in re.finditer(pat, answer, flags=re.IGNORECASE):
+                    anchor_positions.append(m.start())
+            if anchor_positions:
+                for s in skills:
+                    sid = s.get("id")
+                    if not sid or sid in used_ids:
+                        continue
+                    sname = s.get("name", "") or ""
+                    sdesc = s.get("description", "") or ""
+                    match_keys: list[str] = [k for k in (sname, sdesc[:20]) if k]
+                    if not match_keys:
+                        continue
+                    name_lower = sname.lower()
+                    desc_start_lower = sdesc[:20].lower()
+                    hit = False
+                    for pos in anchor_positions:
+                        window_start = max(0, pos - 10)
+                        window_end = min(len(answer), pos + 60)
+                        window = answer_lower[window_start:window_end]
+                        if (name_lower and name_lower in window) or (desc_start_lower and desc_start_lower in window):
+                            hit = True
+                            break
+                    if hit:
+                        used_ids.add(sid)
+
+        # ── 规则3：长回答强命中（>300 字且规则1 top1 为深度调研类） ──
+        if final_answer_len > 300 and jaccard_scores:
+            # 取规则1 得分 top1 的 skill
+            jaccard_scores.sort(key=lambda x: x[1], reverse=True)
+            top1_id, top1_score = jaccard_scores[0]
+            if top1_score > 0:
+                top1_skill = next((s for s in skills if s.get("id") == top1_id), None)
+                if top1_skill:
+                    tname = top1_skill.get("name", "") or ""
+                    tcat = top1_skill.get("category", "") or ""
+                    if has_research_query_flag and ("调研" in tname or tcat in deep_research_categories):
+                        used_ids.add(top1_id)
+
+        return [sid for sid in used_ids if sid]
 
     # ── SSE 构造与解析 ────────────────────────────────
 
@@ -2052,6 +2495,7 @@ class ChatService:
         tool_calls: Any = None,
         tool_results: Any = None,
         thinking: str = None,
+        attachments: Any = None,
     ) -> Message:
         """在当前 session 中持久化消息，并更新会话计数"""
         # 截断过大的内容（MEDIUMTEXT 最大 16MB，保险起见限制 500KB）
@@ -2089,6 +2533,7 @@ class ChatService:
             thinking=thinking,
             tool_calls=tool_calls,
             tool_results=tool_results,
+            attachments=attachments,
             token_count=token_count or self._estimate_tokens(content),
         )
         db.add(msg)
@@ -2109,6 +2554,7 @@ class ChatService:
         tool_calls: Any = None,
         tool_results: Any = None,
         thinking: str = None,
+        attachments: Any = None,
     ) -> Message:
         """使用独立 session 持久化消息（用于流式生成完成后）"""
         async with AsyncSessionLocal() as session:
@@ -2121,6 +2567,7 @@ class ChatService:
                     tool_calls=tool_calls,
                     tool_results=tool_results,
                     thinking=thinking,
+                    attachments=attachments,
                 )
                 await session.commit()
                 return msg
@@ -2159,6 +2606,7 @@ class ChatService:
             thinking=msg.thinking,
             tool_calls=msg.tool_calls,
             tool_results=msg.tool_results,
+            attachments=msg.attachments,
             token_count=msg.token_count or 0,
             created_at=msg.created_at,
         )

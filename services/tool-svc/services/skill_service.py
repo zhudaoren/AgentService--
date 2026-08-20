@@ -10,7 +10,7 @@ import io
 from datetime import datetime
 from typing import Any, Optional
 
-from sqlalchemy import select, func, or_
+from sqlalchemy import select, func, or_, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -161,6 +161,37 @@ class SkillServiceMgr:
         logger.info(f"Skill启用状态变更: id={skill_id}, enabled={enabled}")
         return self._to_out(skill, with_levels=True)
 
+    async def increment_usage(
+        self, db: AsyncSession, skill_id: str, success: bool
+    ) -> SkillOut:
+        """原子更新 Skill usage_count / success_count / success_rate。
+
+        使用原生 SQL UPDATE 避免并发下竞态，然后 re-query 返回最新 SkillOut。
+        """
+        delta = 1 if success else 0
+        stmt = text(
+            """
+            UPDATE skills
+            SET usage_count   = usage_count + 1,
+                success_count = success_count + :delta,
+                success_rate  = IF(usage_count + 1 > 0,
+                                    (success_count + :delta) / (usage_count + 1),
+                                    0)
+            WHERE id = :id
+            """
+        )
+        result = await db.execute(stmt, {"delta": delta, "id": skill_id})
+        await db.flush()
+        if result.rowcount == 0:
+            raise NotFoundException("Skill不存在")
+        skill = await self._get_by_id(db, skill_id, with_levels=False)
+        logger.info(
+            f"Skill使用统计累计: id={skill_id}, success={success}, "
+            f"usage_count={skill.usage_count}, success_count={skill.success_count}, "
+            f"success_rate={skill.success_rate}"
+        )
+        return self._to_out(skill, with_levels=False)
+
     async def list_levels(
         self, db: AsyncSession, skill_id: str
     ) -> list[SkillLevelOut]:
@@ -234,6 +265,7 @@ class SkillServiceMgr:
             storage_path=skill.storage_path or "",
             enabled=bool(skill.enabled),
             usage_count=skill.usage_count or 0,
+            success_count=skill.success_count or 0,
             success_rate=skill.success_rate or 0.0,
             author=skill.author or "",
             tags=skill.tags or [],
@@ -501,11 +533,46 @@ class SkillImportService:
             async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
                 resp = await client.get(source_url)
                 resp.raise_for_status()
-                content = resp.text
+                content_bytes = resp.content
         except Exception as e:
             raise BadRequestException(f"拉取在线内容失败: {e}")
 
         fmt = (import_format or "markdown").lower()
+
+        # ZIP 分支：复用 _import_from_zip，再二次 UPDATE 改成 online 标记
+        if fmt == "zip":
+            from urllib.parse import urlparse as _urlparse
+            try:
+                filename = os.path.basename(_urlparse(source_url).path) or "online_skill.zip"
+            except Exception:
+                filename = "online_skill.zip"
+            if not filename.lower().endswith(".zip"):
+                filename += ".zip"
+            skill_out = await self._import_from_zip(db, filename, content_bytes)
+            skill_id = skill_out.id
+            date_str = datetime.utcnow().strftime("%Y-%m-%d")
+            new_uuid = uuid.uuid4().hex
+            online_storage_path = f"online/{date_str}/{new_uuid}"
+            from sqlalchemy import update as sql_update
+            await db.execute(
+                sql_update(Skill)
+                .where(Skill.id == skill_id)
+                .values(
+                    source="online",
+                    source_url=source_url,
+                    storage_path=online_storage_path,
+                )
+            )
+            await db.flush()
+            logger.info(f"Skill在线ZIP导入成功: id={skill_id}, url={source_url}")
+            return await skill_service.get(db, skill_id, with_levels=True)
+
+        # 非 ZIP：解码为文本处理 markdown/json
+        try:
+            content = content_bytes.decode("utf-8", errors="replace")
+        except Exception as e:
+            raise ValidationException(f"内容解码失败: {e}")
+
         parsed: dict[str, Any] = {}
         if fmt == "json":
             try:

@@ -70,6 +70,7 @@
             <a-tooltip :title="record.description">
               <span class="mcp-name">{{ record.name }}</span>
             </a-tooltip>
+            <a-tag v-if="record.is_builtin" color="blue" style="margin-left: 6px">🛡️ 官方内置</a-tag>
           </template>
           <template v-else-if="column.key === 'mode'">
             <a-tag :color="modeColor(record.mode)">
@@ -138,7 +139,12 @@
               </a-button>
               <a-divider type="vertical" />
               <a-button type="link" size="small" @click="openEdit(record)">编辑</a-button>
-              <a-popconfirm title="确定删除该 MCP 服务？" @confirm="handleDelete(record)">
+              <a-tooltip v-if="record.is_builtin" title="官方内置MCP服务不可删除">
+                <a-popconfirm title="确定删除该 MCP 服务？" @confirm="handleDelete(record)">
+                  <a-button type="link" size="small" danger :disabled="record.is_builtin">删除</a-button>
+                </a-popconfirm>
+              </a-tooltip>
+              <a-popconfirm v-else title="确定删除该 MCP 服务？" @confirm="handleDelete(record)">
                 <a-button type="link" size="small" danger>删除</a-button>
               </a-popconfirm>
             </a-space>
@@ -157,8 +163,8 @@
       @cancel="modalVisible = false"
     >
       <a-form ref="formRef" :model="form" :rules="rules" layout="vertical">
-        <a-form-item label="服务名称" name="name">
-          <a-input v-model:value="form.name" placeholder="例如：文件系统 MCP" />
+        <a-form-item :label="currentIsBuiltin ? '服务名称（官方内置，不可修改）' : '服务名称'" name="name">
+          <a-input v-model:value="form.name" placeholder="例如：文件系统 MCP" :disabled="currentIsBuiltin" />
         </a-form-item>
         <a-form-item label="描述" name="description">
           <div class="description-wrapper">
@@ -182,8 +188,8 @@
             </a-button>
           </div>
         </a-form-item>
-        <a-form-item label="连接模式" name="mode">
-          <a-radio-group v-model:value="form.mode">
+        <a-form-item :label="currentIsBuiltin ? '连接模式（官方内置，不可修改）' : '连接模式'" name="mode">
+          <a-radio-group v-model:value="form.mode" :disabled="currentIsBuiltin">
             <a-radio-button value="streamable_http">
               <global-outlined />
               Streamable HTTP
@@ -204,10 +210,11 @@
         <!-- SSE / Streamable HTTP 模式配置 -->
         <template v-if="form.mode === 'sse' || form.mode === 'streamable_http'">
           <a-divider orientation="left">{{ form.mode === 'sse' ? 'SSE 连接配置 (Legacy)' : 'Streamable HTTP 连接配置' }}</a-divider>
-          <a-form-item :label="form.mode === 'sse' ? 'SSE URL' : 'HTTP URL'" name="sse_url">
+          <a-form-item :label="(form.mode === 'sse' ? 'SSE URL' : 'HTTP URL') + (currentIsBuiltin ? '（官方内置，不可修改）' : '')" name="sse_url">
             <a-input
               v-model:value="form.sse_url"
               placeholder="https://example.com/mcp"
+              :disabled="currentIsBuiltin"
             >
               <template #prefix>
                 <link-outlined />
@@ -331,29 +338,32 @@
         <!-- STDIO 模式配置 -->
         <template v-else>
           <a-divider orientation="left">STDIO 子进程配置</a-divider>
-          <a-form-item label="启动命令" name="command">
+          <a-form-item :label="currentIsBuiltin ? '启动命令（官方内置，不可修改）' : '启动命令'" name="command">
             <a-input
               v-model:value="stdioCommand"
               placeholder="python /path/mcp_server.py"
+              :disabled="currentIsBuiltin"
             >
               <template #prefix>
                 <code-outlined />
               </template>
             </a-input>
           </a-form-item>
-          <a-form-item label="启动参数 args" name="args">
+          <a-form-item :label="currentIsBuiltin ? '启动参数 args（官方内置，不可修改）' : '启动参数 args'" name="args">
             <a-textarea
               v-model:value="stdioArgsText"
               :rows="3"
               placeholder="每行一个参数，例如：&#10;--port&#10;8080&#10;--verbose"
+              :disabled="currentIsBuiltin"
             />
             <div class="form-hint">每行一个参数，提交后将转为 JSON 数组</div>
           </a-form-item>
-          <a-form-item label="环境变量 env" name="env">
+          <a-form-item :label="currentIsBuiltin ? '环境变量 env（官方内置，不可修改）' : '环境变量 env'" name="env">
             <a-textarea
               v-model:value="stdioEnvText"
               :rows="3"
               placeholder="每行 KEY=VALUE，例如：&#10;API_KEY=sk-xxx&#10;DEBUG=true"
+              :disabled="currentIsBuiltin"
             />
             <div class="form-hint">每行 KEY=VALUE，提交后将转为 JSON 对象</div>
           </a-form-item>
@@ -530,6 +540,7 @@ const loading = ref(false)
 const submitting = ref(false)
 const modalVisible = ref(false)
 const isEdit = ref(false)
+const currentIsBuiltin = ref(false)
 const formRef = ref()
 const connectingId = ref(null)
 const disconnectingId = ref(null)
@@ -785,6 +796,7 @@ function handleReset() {
 
 function openCreate() {
   isEdit.value = false
+  currentIsBuiltin.value = false
   Object.assign(form, defaultForm())
   stdioCommand.value = ''
   stdioArgsText.value = ''
@@ -806,6 +818,7 @@ function openCreate() {
 
 function openEdit(record) {
   isEdit.value = true
+  currentIsBuiltin.value = !!record.is_builtin
   Object.assign(form, {
     ...defaultForm(),
     ...record,

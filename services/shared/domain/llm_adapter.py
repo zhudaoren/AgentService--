@@ -5,6 +5,8 @@
 """
 from __future__ import annotations
 
+import json
+import re
 import uuid
 from typing import Any, AsyncIterator, Optional
 
@@ -66,6 +68,85 @@ class LLMAdapter:
     def get_supported_params(self) -> list[str]:
         """获取当前provider支持的参数列表"""
         return self.PROVIDER_SUPPORTED_PARAMS.get(self.provider, [])
+
+    # ── 多模态能力探测 ──────────────────────────────
+
+    _VISION_MODEL_RE = re.compile(
+        r"(vision|vl|image|gpt-4o|gpt-4|deepseek-vl|qwen-vl|qwen2-vl)",
+        re.IGNORECASE,
+    )
+    _VISION_CAPABLE_PROVIDERS = {
+        "openai", "azure_openai", "deepseek", "qwen", "dashscope",
+        "ollama", "zhipuai", "zhipu", "moonshot",
+    }
+
+    def supports_modality(self, modality: str) -> bool:
+        """根据 provider + model_name 判断是否支持多模态。
+
+        - image(视觉): provider 在视觉集合内，且 model_name 命中视觉关键字
+        - audio(input_audio): 暂返回 False（留作后续扩展）
+        """
+        m = (modality or "").lower()
+        if m in {"image", "vision", "visual", "img"}:
+            return (
+                self.provider in self._VISION_CAPABLE_PROVIDERS
+                and bool(self._VISION_MODEL_RE.search(self.model_name or ""))
+            )
+        if m in {"audio", "input_audio"}:
+            return False
+        return False
+
+    # ── 多模态降级：不支持视觉时把数组 content 还原为文本 ──
+
+    def _normalize_messages_for_model(
+        self, messages: list[dict]
+    ) -> list[dict]:
+        """若 user 消息 content 是数组且含视觉附件，但模型不支持视觉，则降级为纯文本。
+
+        降级后文本末尾追加系统提示警告，并打印 WARN 日志。
+        """
+        if not messages:
+            return messages
+        supports_image = self.supports_modality("image")
+        out: list[dict] = []
+        for msg in messages:
+            role = msg.get("role")
+            content = msg.get("content")
+            if role == "user" and isinstance(content, list):
+                has_image = any(
+                    isinstance(p, dict) and p.get("type") == "image_url"
+                    for p in content
+                )
+                if has_image and not supports_image:
+                    text_parts: list[str] = []
+                    for p in content:
+                        if isinstance(p, dict):
+                            if p.get("type") == "text":
+                                text_parts.append(str(p.get("text", "") or ""))
+                            elif p.get("type") == "image_url":
+                                # image 附件降级：文本提醒（信息尽量保序，不展开 URL）
+                                text_parts.append("\n[已忽略图片附件（当前模型不支持视觉）]")
+                            else:
+                                text_parts.append(str(p))
+                        else:
+                            text_parts.append(str(p))
+                    new_text = "".join(text_parts)
+                    warn_suffix = (
+                        "\n\n[系统提示：当前模型不支持图片输入，已忽略你上传的图片/音频附件。"
+                        "请换用视觉模型后重试]"
+                    )
+                    if warn_suffix not in new_text:
+                        new_text = new_text + warn_suffix
+                    logger.warning(
+                        f"多模态降级: provider={self.provider} model={self.model_name} "
+                        f"不支持视觉，user 消息 content 数组已还原为纯文本。"
+                    )
+                    new_msg = dict(msg)
+                    new_msg["content"] = new_text
+                    out.append(new_msg)
+                    continue
+            out.append(msg)
+        return out
 
     def _get_model_kwargs(self) -> dict:
         """根据provider支持的参数，构建模型调用的kwargs（只包含支持的参数）"""
@@ -174,11 +255,36 @@ class LLMAdapter:
         return self._llm
 
     def _reset_llm_with_fallback(self, reason: str):
-        """重置 LLM 实例并使用默认参数重新创建（用于调用阶段的降级）"""
+        """重置 LLM 实例并使用默认参数重新创建（用于调用阶段的降级）
+
+        针对 DeepSeek R1 等推理模型特定错误做定向降级：
+        - "reasoning_content must be passed back": 说明上一轮的 reasoning_content 没有回传
+          给 API。这里会显式关闭 model_kwargs["reasoning_effort"]，避免后续重试仍然请求
+          thinking 模式导致同样 400。
+        """
+        reason_lc = (reason or "").lower()
         logger.warning(f"LLM调用失败，尝试降级到默认参数重试: {reason}")
         self._llm = None
+        # 先尝试裸实例（不带 temperature/max_tokens 等）
         self._llm = self._create_llm_by_provider(with_params=False)
         self._fallback_used = True
+        # DeepSeek R1 thinking 模式定向降级：直接用 model_kwargs 关掉 reasoning
+        if "reasoning_content" in reason_lc and self.provider in ("deepseek", "openai", "moonshot", "kimi", "zhipu", "siliconflow"):
+            try:
+                from langchain_openai import ChatOpenAI
+                base_url = self.api_base_url or ("https://api.deepseek.com/v1" if self.provider == "deepseek" else None)
+                # 注意："none" 是 DeepSeek R1 官方支持的关闭 reasoning 级别；
+                # 使用空字符串会被 API 拒绝（unknown variant）。
+                self._llm = ChatOpenAI(
+                    model=self.model_name,
+                    api_key=self.api_key,
+                    base_url=base_url,
+                    streaming=True,
+                    model_kwargs={"reasoning_effort": "none"},
+                )
+                logger.warning(f"已针对 DeepSeek/OpenAI reasoning 错误降级：reasoning_effort=none，model={self.model_name}")
+            except Exception as e2:
+                logger.warning(f"关闭 reasoning_effort 失败，继续使用默认裸实例: {e2}")
 
     @classmethod
     def get_provider_params_info(cls) -> dict[str, list[str]]:
@@ -188,7 +294,8 @@ class LLMAdapter:
     async def invoke(self, messages: list[dict]) -> str:
         """同步调用 - 返回完整响应（带降级重试）"""
         llm = self._create_llm()
-        lc_messages = self._convert_messages(messages)
+        normalized = self._normalize_messages_for_model(messages)
+        lc_messages = self._convert_messages(normalized)
         try:
             response = await llm.ainvoke(lc_messages)
             return response.content
@@ -202,15 +309,16 @@ class LLMAdapter:
                     response = await self._llm.ainvoke(lc_messages)
                     return response.content
                 except Exception as e2:
-                    logger.error(f"降级重试仍失败: {e2}")
+                    logger.error(f"降级重试仍失败: {e2}", exc_info=True)
                     raise LLMException(f"LLM调用失败: {str(e2)}")
-            logger.error(f"LLM调用失败: {e}")
+            logger.error(f"LLM调用失败: {e}", exc_info=True)
             raise LLMException(f"LLM调用失败: {str(e)}")
 
     async def stream(self, messages: list[dict]) -> AsyncIterator[str]:
         """流式调用 - 逐块返回（带降级重试）"""
         llm = self._create_llm()
-        lc_messages = self._convert_messages(messages)
+        normalized = self._normalize_messages_for_model(messages)
+        lc_messages = self._convert_messages(normalized)
         try:
             async for chunk in llm.astream(lc_messages):
                 if chunk.content:
@@ -226,24 +334,131 @@ class LLMAdapter:
                             yield chunk.content
                     return
                 except Exception as e2:
-                    logger.error(f"降级重试仍失败: {e2}")
+                    logger.error(f"降级重试仍失败: {e2}", exc_info=True)
                     raise LLMException(f"LLM流式调用失败: {str(e2)}")
-            logger.error(f"LLM流式调用失败: {e}")
+            logger.error(f"LLM流式调用失败: {e}", exc_info=True)
             raise LLMException(f"LLM流式调用失败: {str(e)}")
 
     def _convert_messages(self, messages: list[dict]) -> list:
-        """将dict格式消息转换为LangChain消息对象"""
+        """将dict格式消息转换为LangChain消息对象
+
+        前置步骤：对多模态数组 content 执行降级（若模型不支持视觉）。
+        支持 user 消息 content 为数组（多模态）；其它 role 若为数组则拼成字符串。
+        """
         from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+        messages = self._normalize_messages_for_model(messages)
         result = []
         for msg in messages:
             role = msg.get("role", "user")
             content = msg.get("content", "")
             if role == "system":
+                if isinstance(content, list):
+                    text_parts = []
+                    for p in content:
+                        if isinstance(p, dict) and p.get("type") == "text":
+                            text_parts.append(str(p.get("text", "") or ""))
+                        else:
+                            text_parts.append(str(p))
+                    content = "".join(text_parts)
                 result.append(SystemMessage(content=content))
             elif role == "assistant":
-                result.append(AIMessage(content=content))
+                if isinstance(content, list):
+                    text_parts = []
+                    for p in content:
+                        if isinstance(p, dict) and p.get("type") == "text":
+                            text_parts.append(str(p.get("text", "") or ""))
+                        else:
+                            text_parts.append(str(p))
+                    content = "".join(text_parts)
+                lc_msg = AIMessage(content=content)
+                # ── reasoning_content 回传（DeepSeek R1 / thinking 模型必填） ──────
+                # 若上一轮 LLM 返回了 reasoning_content，必须在下一轮以 AIMessage 的
+                # additional_kwargs["reasoning_content"] 形式回传，否则 DeepSeek API
+                # 会抛 400: "The reasoning_content in the thinking mode must be passed back"
+                add_kwargs: dict = {}
+                extra_rc = msg.get("reasoning_content") or msg.get("additional_kwargs", {}).get("reasoning_content")
+                if isinstance(extra_rc, str) and extra_rc.strip():
+                    add_kwargs["reasoning_content"] = extra_rc
+                # 其它来自上一轮 AIMessage 的额外字段原样透传
+                extras = msg.get("additional_kwargs") if isinstance(msg.get("additional_kwargs"), dict) else {}
+                for k, v in extras.items():
+                    if k == "reasoning_content":
+                        continue
+                    add_kwargs[k] = v
+                if add_kwargs:
+                    try:
+                        lc_msg.additional_kwargs = add_kwargs
+                    except Exception:
+                        pass
+                # 兼容 function calling: assistant 消息可能携带 tool_calls 字段
+                tool_calls = msg.get("tool_calls")
+                if tool_calls and isinstance(tool_calls, list):
+                    try:
+                        normalized_tcs: list[dict] = []
+                        for tc in tool_calls:
+                            if not isinstance(tc, dict):
+                                continue
+                            # 支持两种格式：
+                            # (A) LangChain原生: {name, args, id, type}
+                            # (B) OpenAI API:  {id, type:"function", function:{name, arguments:<str_or_dict>}}
+                            if "name" in tc and "args" in tc:
+                                n_tc = {
+                                    "name": str(tc.get("name") or ""),
+                                    "args": tc.get("args") if isinstance(tc.get("args"), dict) else {},
+                                    "id": str(tc.get("id") or ""),
+                                }
+                                if tc.get("type"):
+                                    n_tc["type"] = tc["type"]
+                                normalized_tcs.append(n_tc)
+                                continue
+                            fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+                            raw_name = fn.get("name") or tc.get("tool_name") or tc.get("name") or ""
+                            raw_args = fn.get("arguments") or tc.get("arguments") or {}
+                            if isinstance(raw_args, str):
+                                try:
+                                    parsed_args = json.loads(raw_args)
+                                    args_dict = parsed_args if isinstance(parsed_args, dict) else {}
+                                except Exception:
+                                    args_dict = {}
+                            elif isinstance(raw_args, dict):
+                                args_dict = raw_args
+                            else:
+                                args_dict = {}
+                            normalized_tcs.append({
+                                "name": str(raw_name or ""),
+                                "args": args_dict,
+                                "id": str(tc.get("id") or ""),
+                                "type": tc.get("type") or "tool_call",
+                            })
+                        # LangChain AIMessage 序列化时需要 tool_call_chunks/tool_calls 都有 `name` 键
+                        # 否则会抛 KeyError('name')。因此显式赋值并校验。
+                        if normalized_tcs:
+                            lc_msg.tool_calls = normalized_tcs
+                    except Exception:
+                        logger.warning("AIMessage tool_calls 归一化失败，跳过该字段", exc_info=True)
+                result.append(lc_msg)
             else:
-                result.append(HumanMessage(content=content))
+                # user / tool 等：HumanMessage 支持 list content（多模态）
+                if role == "tool":
+                    from langchain_core.messages import ToolMessage
+                    tool_call_id = str(msg.get("tool_call_id") or f"toolcall_{id(result)}")
+                    raw_name = (
+                        msg.get("name")
+                        or msg.get("tool_name")
+                        or (msg.get("tool") if isinstance(msg.get("tool"), str) else None)
+                        or ""
+                    )
+                    tool_name = str(raw_name or "tool") or "tool"
+                    # langchain_core 在序列化 ToolMessage 时（特别是 bind_tools 后的
+                    # astream 多轮）会读取 tm.name 做 API 请求体拼装，必须显式传入
+                    # 非空 name 与 tool_call_id，否则会抛 KeyError('name'/'tool_call_id')。
+                    result.append(ToolMessage(
+                        content=content if not isinstance(content, list) else str(content),
+                        tool_call_id=tool_call_id,
+                        name=tool_name,
+                    ))
+                else:
+                    result.append(HumanMessage(content=content))
         return result
 
 

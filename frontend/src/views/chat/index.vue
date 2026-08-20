@@ -130,6 +130,15 @@
                 <div class="msg-bubble user-bubble">
                   <div class="msg-content markdown-body" v-html="renderMarkdown(msg.content, searchText)"></div>
                 </div>
+                <div v-if="msg.attachments?.length" class="user-attachments">
+                  <template v-for="(att, idx) in msg.attachments" :key="'att-' + (msg.id || msg._temp_id) + '-' + idx">
+                    <a-image v-if="att.type === 'image'" :src="att.data_url || att.url" style="max-width:220px; margin: 4px 4px 0 0;" :preview="true" />
+                    <div v-else-if="att.type === 'audio'" class="audio-chip" style="margin:4px 0">
+                      <audio controls :src="att.data_url || att.url"></audio>
+                      <span class="audio-name">{{ att.name }}</span>
+                    </div>
+                  </template>
+                </div>
                 <div class="user-msg-footer" v-if="!streaming || !msg._temp_id">
                   <span v-if="msg.created_at" class="msg-time">{{ formatTime(msg.created_at) }}</span>
                   <button class="msg-action-btn" @click="copyMessage(msg.content)">
@@ -177,7 +186,10 @@
                     <down-outlined class="thinking-toggle" :class="{ rotated: msg._thinkingCollapsed }" />
                   </div>
                   <div v-show="!msg._thinkingCollapsed" class="thinking-content markdown-body">
-                    <div v-if="msg.thinking" v-html="renderMarkdown(msg.thinking, searchText)"></div>
+                    <template v-if="msg.thinking" v-for="(seg, tIdx) in splitMermaidSegmentsText(msg.thinking)" :key="'th-' + (msg.id || msg._temp_id) + '-' + tIdx">
+                      <MermaidBlock v-if="seg.type === 'mermaid'" :code="seg.code" title="思考中的设计图" />
+                      <div v-else v-html="renderMarkdown(seg.text, searchText)"></div>
+                    </template>
                     <div v-else-if="msg._thinkingMigrated && !msg._thinkingActive" class="thinking-empty">
                       <span class="thinking-empty-text">💡 思考过程已迁移至最终回答</span>
                     </div>
@@ -344,7 +356,10 @@
                   </div>
                   <div v-show="!msg._answerCollapsed" class="answer-content">
                     <div class="msg-content markdown-body assistant-text" :class="{ 'is-error-content': msg._is_error }">
-                      <div v-html="renderMarkdown(msg.content, searchText)"></div>
+                      <template v-for="(seg, segIdx) in splitMermaidSegmentsText(msg.content)" :key="'ans-' + (msg.id || msg._temp_id) + '-' + segIdx">
+                        <MermaidBlock v-if="seg.type === 'mermaid'" :code="seg.code" title="软件设计图" />
+                        <div v-else v-html="renderMarkdown(seg.text, searchText)"></div>
+                      </template>
                       <span v-if="streaming && msg._temp_id && msg.content" class="streaming-cursor"></span>
                     </div>
                     <div class="msg-footer" v-if="msg.content && !streaming">
@@ -427,19 +442,42 @@
 
         <!-- 输入区域 -->
         <div class="chat-input-area">
-          <a-textarea
-            v-model:value="inputText"
-            :auto-size="{ minRows: 1, maxRows: 6 }"
-            placeholder="输入消息，按 Enter 发送，Shift+Enter 换行"
-            class="chat-input"
-            :disabled="streaming"
-            @keydown="handleKeydown"
-          />
+          <div style="flex:1; display:flex; flex-direction:column; gap:8px;">
+            <a-textarea
+              v-model:value="inputText"
+              :auto-size="{ minRows: 1, maxRows: 6 }"
+              placeholder="输入消息，按 Enter 发送，Shift+Enter 换行"
+              class="chat-input"
+              :disabled="streaming"
+              @keydown="handleKeydown"
+            />
+            <div v-if="attachments.length" class="attachment-bar">
+              <div v-for="(att,i) in attachments" :key="att.id" class="attachment-chip">
+                <img v-if="att.type==='image'" class="att-thumb" :src="att.data_url" />
+                <span v-else class="att-audio-icon">🎵</span>
+                <div class="att-meta">
+                  <div class="att-name">{{ att.name }}</div>
+                  <div class="att-size">{{ formatSize(att.size) }}</div>
+                </div>
+                <a-button type="link" size="small" danger @click="removeAttachment(i)">×</a-button>
+              </div>
+            </div>
+            <div class="chat-input-toolbar">
+              <a-upload
+                :multiple="true"
+                :before-upload="beforeAttachmentUpload"
+                :show-upload-list="false"
+                accept="image/*,audio/*"
+              >
+                <a-button type="text" :title="'上传附件（图片/音频）'">📎 附件</a-button>
+              </a-upload>
+            </div>
+          </div>
           <div class="chat-input-actions">
             <a-button
               v-if="!streaming"
               type="primary"
-              :disabled="!inputText.trim()"
+              :disabled="!inputText.trim() && attachments.length === 0"
               :loading="false"
               @click="handleSend"
             >
@@ -614,6 +652,7 @@ import {
   CloseOutlined,
 } from '@ant-design/icons-vue'
 import { marked } from 'marked'
+import MermaidBlock from '@/components/MermaidBlock.vue'
 import { conversationApi, chatApi, agentApi } from '@/api'
 
 // 折叠显示组件（内联）
@@ -687,6 +726,60 @@ const streaming = ref(false)
 const streamingText = ref('')
 const regenerating = ref(false)
 let abortController = null
+
+// ============ 附件上传 ============
+const attachments = ref([]) // [{id, type, mime, name, data_url, size}]
+const maxAttSize = 8 * 1024 * 1024        // 8MB per file
+const maxTotalSize = 30 * 1024 * 1024     // 30MB total
+
+function formatSize(bytes) {
+  if (!bytes || bytes <= 0) return '0 B'
+  const units = ['B', 'KB', 'MB', 'GB']
+  let i = 0
+  let n = bytes
+  while (n >= 1024 && i < units.length - 1) { n /= 1024; i++ }
+  return `${n.toFixed(n >= 10 || i === 0 ? 0 : 1)} ${units[i]}`
+}
+
+function removeAttachment(i) {
+  attachments.value.splice(i, 1)
+}
+
+function beforeAttachmentUpload(file) {
+  const mime = file.type || ''
+  const isImage = mime.startsWith('image/')
+  const isAudio = mime.startsWith('audio/')
+  if (!isImage && !isAudio) {
+    message.warning('仅支持图片/音频附件')
+    return false
+  }
+  if (file.size > maxAttSize) {
+    message.warning(`单文件不能超过 ${formatSize(maxAttSize)}`)
+    return false
+  }
+  const totalNow = attachments.value.reduce((s, a) => s + (a.size || 0), 0) + file.size
+  if (totalNow > maxTotalSize) {
+    message.warning(`附件总大小不能超过 ${formatSize(maxTotalSize)}`)
+    return false
+  }
+  if (isAudio && file.size > maxAttSize) {
+    message.warning(`音频超过 ${formatSize(maxAttSize)}，已跳过`)
+    return false
+  }
+  const reader = new FileReader()
+  reader.onload = (e) => {
+    attachments.value.push({
+      id: Date.now() + '_' + Math.random().toString(36).slice(2, 8),
+      type: isImage ? 'image' : 'audio',
+      mime,
+      name: file.name,
+      size: file.size,
+      data_url: e.target.result,
+    })
+  }
+  reader.readAsDataURL(file)
+  return false // 阻止 ant-design 自动上传
+}
 
 // ============ 新建会话 ============
 const newConvVisible = ref(false)
@@ -982,6 +1075,34 @@ function renderMarkdown(text, keywords = '') {
   }
 }
 
+// ============ Mermaid 代码块分段渲染支持 ============
+function extractMermaidBlocks(content) {
+  if (!content) return { text: content || '', blocks: [] }
+  const blocks = []
+  const regex = /```mermaid\s*\n([\s\S]*?)```/g
+  let i = 0
+  const text = content.replace(regex, (match, code) => {
+    blocks.push({ index: i++, code: code.trim() })
+    return `\n__MERMAID_BLOCK_PLACEHOLDER_${i - 1}__\n`
+  })
+  return { text, blocks }
+}
+function splitMermaidSegments(content) {
+  const { text, blocks } = extractMermaidBlocks(content)
+  const out = []
+  text.split(/__MERMAID_BLOCK_PLACEHOLDER_(\d+)__/g).forEach((chunk, k) => {
+    if (k % 2 === 0) {
+      if (chunk) out.push({ type: 'text', text: chunk })
+    } else {
+      const idx = parseInt(chunk, 10)
+      const blk = blocks[idx]
+      if (blk) out.push({ type: 'mermaid', code: blk.code })
+    }
+  })
+  return out
+}
+const splitMermaidSegmentsText = (raw) => splitMermaidSegments(raw || '')
+
 function formatTime(t) {
   if (!t) return ''
   try {
@@ -1034,6 +1155,7 @@ function handleRetry(msg) {
       payload: {
         conversation_id: currentConvId.value,
         content: userMsg.content,
+        attachments: userMsg.attachments || [],
       },
       isRegenerate: true,
     })
@@ -1119,13 +1241,22 @@ async function selectConversation(conv) {
 }
 
 // 规范化 tool_calls：后端存储格式兼容
-// 后端可能存储为 [ ... ] 或 { "calls": [ ... ] }
+// 后端可能存储为 [ ... ] 或 { "calls": [ ... ], "_plan_steps": [...], "_skills_used": [...] }
+// 返回：{ calls, planSteps, skillsUsed, planDurationMs }
 function normalizeToolCalls(raw) {
-  if (!raw) return []
-  if (Array.isArray(raw)) return raw
-  if (raw && typeof raw === 'object' && Array.isArray(raw.calls)) return raw.calls
-  if (raw && typeof raw === 'object' && Array.isArray(raw.tool_calls)) return raw.tool_calls
-  return []
+  if (!raw) return { calls: [], planSteps: [], skillsUsed: [], planDurationMs: 0 }
+  let calls = []
+  if (Array.isArray(raw)) {
+    calls = raw
+  } else if (raw && typeof raw === 'object') {
+    if (Array.isArray(raw.calls)) calls = raw.calls
+    else if (Array.isArray(raw.tool_calls)) calls = raw.tool_calls
+  }
+  // 附加元信息（刷新后恢复用）
+  const planSteps = Array.isArray(raw?._plan_steps) ? raw._plan_steps : []
+  const skillsUsed = Array.isArray(raw?._skills_used) ? raw._skills_used : []
+  const planDurationMs = raw?._plan_duration_ms || 0
+  return { calls, planSteps, skillsUsed, planDurationMs }
 }
 
 async function loadMessages(convId) {
@@ -1147,8 +1278,9 @@ async function loadMessages(convId) {
       let toolName = m.tool_name || m.name || ''
       let toolResult = m.result
       let toolError = m.error
-      if (!toolName && normalizedTc.length > 0) {
-        toolName = normalizedTc[0].tool_name || normalizedTc[0].name || ''
+      const tcCalls = normalizedTc.calls || []
+      if (!toolName && tcCalls.length > 0) {
+        toolName = tcCalls[0].tool_name || tcCalls[0].name || ''
       }
       if (messageType === 'tool_result' && m.tool_results) {
         const results = Array.isArray(m.tool_results) ? m.tool_results : (m.tool_results.results || m.tool_results.calls || [])
@@ -1159,12 +1291,21 @@ async function loadMessages(convId) {
           if (toolError === undefined) toolError = r.error || r.error_message || ''
         }
       }
+      // 从持久化字段恢复计划/技能（如果原消息没有，用 tool_calls 里附加的元信息）
+      const restoredPlanSteps = (Array.isArray(m.plan_steps) && m.plan_steps.length)
+        ? m.plan_steps
+        : normalizedTc.planSteps
+      const restoredSkillsUsed = (Array.isArray(m.skills_used) && m.skills_used.length)
+        ? m.skills_used
+        : normalizedTc.skillsUsed
+      const restoredPlanDuration = (m.plan_duration_ms ?? normalizedTc.planDurationMs) || 0
       return {
         ...m,
         role,
         content: m.content ?? m.text ?? '',
         message_type: messageType,
-        tool_calls: normalizedTc,
+        attachments: m.attachments || null,
+        tool_calls: tcCalls,
         tool_name: toolName,
         name: toolName,
         result: toolResult,
@@ -1172,10 +1313,12 @@ async function loadMessages(convId) {
         _toolsCollapsed: false,
         _toolLoading: false,
         _planCollapsed: false,
-        plan_steps: Array.isArray(m.plan_steps) ? m.plan_steps.map((s, i) => ({
+        plan_steps: restoredPlanSteps.map((s, i) => ({
           ...s,
           _status: s._status || 'done',
-        })) : [],
+        })),
+        skills_used: restoredSkillsUsed,
+        plan_duration_ms: restoredPlanDuration,
       }
     })
     
@@ -1190,8 +1333,11 @@ async function loadMessages(convId) {
         // 收集工具调用
         pendingToolCalls.push(...msg.tool_calls.map(tc => ({
           ...tc,
-          // 只有当没有结果和错误时才设为 loading，否则保留原始状态
-          status: (tc.result !== undefined && tc.result !== null) || tc.error ? (tc.status || 'success') : 'loading',
+          // 只有当没有结果和错误、且没有已明确 status 时才设为 loading，
+          // 否则保留原始状态（例如持久化里的 success/failed）
+          status: (tc.status === 'success' || tc.status === 'failed')
+            ? tc.status
+            : ((tc.result !== undefined && tc.result !== null) || tc.error) ? (tc.status || 'success') : 'loading',
         })))
         continue  // 跳过独立的 tool_call 消息
       }
@@ -1268,12 +1414,18 @@ async function loadMessages(convId) {
           msg._thinkingActive = false
           msg._thinkingDuration = null
         }
-        // 初始化计划相关字段
+        // 初始化计划/技能相关字段（兼容历史消息）
         if (!msg.plan_steps) {
           msg.plan_steps = []
         }
+        if (!Array.isArray(msg.skills_used)) {
+          msg.skills_used = []
+        }
         if (!msg._planCollapsed) {
           msg._planCollapsed = false
+        }
+        if (!msg._skillsCollapsed) {
+          msg._skillsCollapsed = false
         }
       }
       
@@ -1537,7 +1689,7 @@ function startStream({ payload, isRegenerate = false }) {
           scrollToBottom()
           return
         }
-        // 思考转最终回答事件（最终轮）→ 分离思考和回答，回答将通过 message 事件流式推送
+        // 思考转最终回答事件（最终轮）→ 分离思考和回答
         if (data.type === 'thinking_to_answer' || data.event === 'thinking_to_answer') {
           const durationMs = data.duration_ms || 0
           assistantMsg._thinkingActive = false
@@ -1547,16 +1699,16 @@ function startStream({ payload, isRegenerate = false }) {
           assistantMsg._thinkingMigrated = true
           stopThinkingTimer()
 
-          // 设置思考内容（中间轮推理），或清空（直接回答场景）
-          // NOTE: 使用 != null 同时过滤 null 和 undefined，为 null 时不清空已存在的思考
-          if (data.thinking_content != null) {
-            assistantMsg.thinking = data.thinking_content || ''
+          // 设置中间推理内容（如果有）
+          if (data.thinking_content != null && data.thinking_content) {
+            // 有中间推理：保留到思考区作为历史推理记录
+            assistantMsg.thinking = data.thinking_content
           } else {
-            // 无中间推理：清空之前累积的 thinking（那是最终回答文本），显示迁移提示
+            // 无中间推理：清空思考区（最终回答已通过 message 事件在回答区展示）
             assistantMsg.thinking = ''
           }
 
-          // 重置 _answerSet 确保 message 事件能正常追加
+          // 重置 _answerSet 确保后续 message 事件能正常追加
           assistantMsg._answerSet = false
           scrollToBottom()
           return
@@ -1918,16 +2070,25 @@ function appendToolResultMessage(data) {
 
 async function handleSend() {
   const content = inputText.value.trim()
-  if (!content || streaming.value) return
+  if ((!content && attachments.value.length === 0) || streaming.value) return
+
+  const attPayload = attachments.value.map(a => ({
+    type: a.type,
+    mime: a.mime,
+    name: a.name,
+    data_url: a.data_url,
+  }))
 
   const userMsg = {
     role: 'user',
     content,
+    attachments: attPayload.length ? attPayload : null,
     _temp_id: Date.now() + '_u',
     created_at: new Date().toISOString(),
   }
   messages.value.push(userMsg)
   inputText.value = ''
+  attachments.value = []
   await nextTick()
   scrollToBottom()
 
@@ -1935,6 +2096,7 @@ async function handleSend() {
     payload: {
       conversation_id: currentConvId.value,
       content,
+      attachments: attPayload,
     },
   })
 }
@@ -1959,6 +2121,7 @@ async function handleRegenerate() {
     payload: {
       conversation_id: currentConvId.value,
       content: userMsg.content || '',
+      attachments: userMsg.attachments || [],
     },
     isRegenerate: true,
   })
@@ -3351,5 +3514,92 @@ onUnmounted(() => {
 
 .conv-list::-webkit-scrollbar-thumb:hover {
   background: #d9d9d9;
+}
+
+/* 附件工具栏 / 预览条 */
+.chat-input-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 2px;
+}
+.attachment-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 2px 2px 0;
+}
+.attachment-chip {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px 6px 6px;
+  border: 1px solid #e8e8e8;
+  border-radius: 10px;
+  background: #fafafa;
+  max-width: 280px;
+}
+.att-thumb {
+  width: 40px;
+  height: 40px;
+  object-fit: cover;
+  border-radius: 6px;
+  flex-shrink: 0;
+}
+.att-audio-icon {
+  width: 40px;
+  height: 40px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: #f0f5ff;
+  border-radius: 6px;
+  font-size: 20px;
+  flex-shrink: 0;
+}
+.att-meta {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+}
+.att-name {
+  font-size: 12px;
+  color: #1f1f1f;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.att-size {
+  font-size: 11px;
+  color: #8c8c8c;
+}
+
+/* 用户消息中附件展示 */
+.user-attachments {
+  display: flex;
+  flex-wrap: wrap;
+  max-width: 100%;
+  margin-top: 6px;
+  justify-content: flex-end;
+}
+.audio-chip {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  background: #fff7e6;
+  border: 1px solid #ffd591;
+  border-radius: 8px;
+}
+.audio-chip audio {
+  height: 32px;
+}
+.audio-name {
+  font-size: 12px;
+  color: #d46b08;
+  max-width: 160px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 </style>
